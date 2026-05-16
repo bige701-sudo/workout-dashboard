@@ -1,8 +1,10 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import requests
 import os
+import sqlite3
+import json
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 app = Flask(__name__)
@@ -21,6 +23,130 @@ def load_env():
 load_env()
 LYFTA_API_KEY = os.environ.get('LYFTA_API_KEY', '')
 LYFTA_BASE = 'https://my.lyfta.app'
+
+# ─── Database ─────────────────────────────────────────────
+DB_PATH = os.path.join(os.path.dirname(__file__), 'workouts.db')
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS workouts (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                lyfta_key   TEXT UNIQUE NOT NULL,
+                date        TEXT NOT NULL,
+                title       TEXT,
+                total_volume REAL,
+                raw_json    TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS exercise_sets (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                workout_id    INTEGER NOT NULL,
+                date          TEXT NOT NULL,
+                exercise_name TEXT NOT NULL,
+                weight        REAL NOT NULL,
+                reps          INTEGER NOT NULL,
+                e1rm          REAL,
+                FOREIGN KEY (workout_id) REFERENCES workouts(id)
+            );
+            CREATE TABLE IF NOT EXISTS session_context (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                lyfta_key     TEXT UNIQUE NOT NULL,
+                workout_date  TEXT NOT NULL,
+                workout_title TEXT NOT NULL,
+                rpe           INTEGER,
+                sleep_quality INTEGER,
+                soreness      INTEGER,
+                nutrition     TEXT,
+                notes         TEXT,
+                logged_at     TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS known_1rm (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                exercise_name TEXT NOT NULL,
+                date          TEXT NOT NULL,
+                weight_lbs    REAL NOT NULL,
+                notes         TEXT,
+                created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(exercise_name, date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sets_exercise ON exercise_sets(exercise_name);
+            CREATE INDEX IF NOT EXISTS idx_sets_date     ON exercise_sets(date);
+        ''')
+
+def _insert_sets_for_workout(conn, wid, date_only, w):
+    for ex in w.get('exercises', []):
+        name = ex.get('excercise_name', '')
+        if not name:
+            continue
+        for s in ex.get('sets', []):
+            try:
+                weight = float(s.get('weight') or 0)
+                reps   = int(s.get('reps') or 0)
+            except (ValueError, TypeError):
+                continue
+            if weight > 0 and reps > 0:
+                conn.execute(
+                    'INSERT INTO exercise_sets '
+                    '(workout_id, date, exercise_name, weight, reps, e1rm) '
+                    'VALUES (?,?,?,?,?,?)',
+                    (wid, date_only, name, weight, reps, epley_1rm(weight, reps))
+                )
+
+def rebuild_exercise_sets():
+    """Clear and rebuild exercise_sets from stored raw_json. Fixes duplicate-row bugs."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('DELETE FROM exercise_sets')
+        rows = conn.execute('SELECT id, raw_json FROM workouts').fetchall()
+        for wid, raw in rows:
+            w = json.loads(raw)
+            date_str = w.get('workout_perform_date', '')
+            try:
+                date_only = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
+            except ValueError:
+                continue
+            _insert_sets_for_workout(conn, wid, date_only, w)
+
+def upsert_workouts_to_db(workouts):
+    with sqlite3.connect(DB_PATH) as conn:
+        for w in workouts:
+            date_str  = w.get('workout_perform_date', '')
+            title     = w.get('title', '')
+            total_vol = w.get('total_volume', 0) or 0
+            try:
+                dt        = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                date_only = dt.strftime('%Y-%m-%d')
+            except ValueError:
+                continue
+            lyfta_key = f"{date_only}|{title}"
+            # INSERT OR IGNORE preserves the existing row ID so the FK in
+            # exercise_sets stays valid; UPDATE keeps the data current.
+            conn.execute(
+                'INSERT OR IGNORE INTO workouts (lyfta_key, date, title, total_volume, raw_json) '
+                'VALUES (?,?,?,?,?)',
+                (lyfta_key, date_only, title, total_vol, json.dumps(w))
+            )
+            conn.execute(
+                'UPDATE workouts SET date=?, title=?, total_volume=?, raw_json=? WHERE lyfta_key=?',
+                (date_only, title, total_vol, json.dumps(w), lyfta_key)
+            )
+            row = conn.execute('SELECT id FROM workouts WHERE lyfta_key=?', (lyfta_key,)).fetchone()
+            if not row:
+                continue
+            wid = row[0]
+            conn.execute('DELETE FROM exercise_sets WHERE workout_id=?', (wid,))
+            _insert_sets_for_workout(conn, wid, date_only, w)
+
+def load_workouts_from_db():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                'SELECT raw_json FROM workouts ORDER BY date ASC'
+            ).fetchall()
+            return [json.loads(r[0]) for r in rows]
+    except Exception:
+        return []
+
+init_db()
 
 # ─── In-memory cache ──────────────────────────────────────
 _cache = {'workouts': None, 'last_refresh': None, 'error': None}
@@ -53,12 +179,19 @@ def refresh_cache():
             _cache['workouts'] = workouts
             _cache['last_refresh'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             _cache['error'] = None
+            upsert_workouts_to_db(workouts)
         except Exception as e:
             _cache['error'] = str(e)
 
 def get_workouts():
     if _cache['workouts'] is None:
-        refresh_cache()
+        db_workouts = load_workouts_from_db()
+        if db_workouts:
+            with _lock:
+                if _cache['workouts'] is None:
+                    _cache['workouts'] = db_workouts
+        else:
+            refresh_cache()
     return _cache['workouts'] or []
 
 # ─── Data processing ──────────────────────────────────────
@@ -258,6 +391,341 @@ def api_exercise_detail(name):
         'stats':   exercise_stats.get(name, {}),
     })
 
+# ─── Analysis engine ──────────────────────────────────────
+import numpy as np
+from scipy import stats as sp_stats
+
+def _exercise_sessions(exercise_name):
+    """Per-session best weight, sets, and volume for one exercise."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute('''
+            SELECT date,
+                   MAX(weight)          AS best_weight,
+                   COUNT(*)             AS total_sets,
+                   SUM(weight * reps)   AS total_volume
+            FROM   exercise_sets
+            WHERE  exercise_name = ?
+            GROUP  BY date
+            ORDER  BY date ASC
+        ''', (exercise_name,)).fetchall()
+    return [{'date': r[0], 'best_weight': r[1],
+             'total_sets': r[2], 'total_volume': r[3]} for r in rows]
+
+def _rolling_max(values, window=3):
+    """Smooths noise by taking the max over a rolling window."""
+    out = []
+    for i in range(len(values)):
+        out.append(max(values[max(0, i - window + 1): i + 1]))
+    return out
+
+def _linear_trend(dates, values):
+    """OLS regression. Returns slope in lbs/week and R²."""
+    if len(values) < 3:
+        return None
+    d0 = datetime.strptime(dates[0], '%Y-%m-%d')
+    x  = np.array([(datetime.strptime(d, '%Y-%m-%d') - d0).days for d in dates], dtype=float)
+    y  = np.array(values, dtype=float)
+    slope, intercept, r, _, _ = sp_stats.linregress(x, y)
+    predicted = (intercept + slope * x).tolist()
+    return {
+        'slope_per_week': round(float(slope) * 7, 2),
+        'r_squared':      round(float(r ** 2), 3),
+        'intercept':      float(intercept),
+        'predicted':      predicted,
+    }
+
+def _off_days(sessions, window=4, threshold=0.12):
+    """Flag sessions >12 % below the rolling average of the prior N sessions."""
+    flagged = []
+    weights = [s['best_weight'] for s in sessions]
+    for i, s in enumerate(sessions):
+        if i < window:
+            continue
+        avg = np.mean(weights[i - window: i])
+        if avg > 0 and (weights[i] - avg) / avg < -threshold:
+            flagged.append({
+                'date':          s['date'],
+                'deviation_pct': round(((weights[i] - avg) / avg) * 100, 1),
+            })
+    return flagged
+
+def _weekly_volume(exercise_name, weeks=10):
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute('''
+            SELECT strftime('%Y-W%W', date) AS week,
+                   SUM(weight * reps)       AS volume,
+                   COUNT(*)                 AS sets
+            FROM   exercise_sets
+            WHERE  exercise_name = ?
+            GROUP  BY week
+            ORDER  BY week DESC
+            LIMIT  ?
+        ''', (exercise_name, weeks)).fetchall()
+    return [{'week': r[0], 'volume': round(r[1]), 'sets': r[2]}
+            for r in reversed(rows)]
+
+def analyze_exercise(exercise_name):
+    sessions = _exercise_sessions(exercise_name)
+    if len(sessions) < 4:
+        return None
+
+    dates   = [s['date']        for s in sessions]
+    weights = [s['best_weight'] for s in sessions]
+    smoothed = _rolling_max(weights, window=3)
+
+    trend = _linear_trend(dates, smoothed)
+
+    # Recent 4-week trend (detect stalls even when all-time trend is positive)
+    cutoff = (datetime.now() - timedelta(days=28)).strftime('%Y-%m-%d')
+    recent_s = [s for s in sessions if s['date'] >= cutoff]
+    recent_weights  = [s['best_weight'] for s in recent_s]
+    recent_smoothed = _rolling_max(recent_weights, window=3)
+    recent_trend = (
+        _linear_trend([s['date'] for s in recent_s], recent_smoothed)
+        if len(recent_s) >= 3 else None
+    )
+
+    return {
+        'name':         exercise_name,
+        'session_count': len(sessions),
+        'all_time_max': max(weights),
+        'current_max':  weights[-1],
+        'dates':        dates,
+        'weights':      weights,
+        'smoothed':     smoothed,
+        'trend':        trend,
+        'recent_trend': recent_trend,
+        'off_days':     _off_days(sessions),
+        'weekly_volume': _weekly_volume(exercise_name),
+    }
+
+def fatigue_indicator():
+    """Compare last 4 weeks volume load to prior 4 weeks."""
+    with sqlite3.connect(DB_PATH) as conn:
+        recent = conn.execute(
+            "SELECT COALESCE(SUM(weight*reps),0) FROM exercise_sets "
+            "WHERE date >= date('now','-28 days')"
+        ).fetchone()[0]
+        prior = conn.execute(
+            "SELECT COALESCE(SUM(weight*reps),0) FROM exercise_sets "
+            "WHERE date >= date('now','-56 days') AND date < date('now','-28 days')"
+        ).fetchone()[0]
+
+    pct = round(((recent - prior) / prior * 100), 1) if prior else 0
+    level = ('high' if pct > 20 else
+             'elevated' if pct > 5 else
+             'low' if pct < -20 else 'normal')
+    return {'level': level, 'pct_change': pct,
+            'recent_4wk': round(recent), 'prev_4wk': round(prior)}
+
+def context_correlations():
+    """Correlate sleep/soreness with total session volume (needs ≥5 entries)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute('''
+            SELECT sc.sleep_quality, sc.soreness, sc.nutrition, w.total_volume
+            FROM   session_context sc
+            JOIN   workouts w ON w.lyfta_key = sc.lyfta_key
+            WHERE  sc.sleep_quality IS NOT NULL AND w.total_volume > 0
+        ''').fetchall()
+    if len(rows) < 5:
+        return None
+
+    by_sleep = {}
+    for sleep, soreness, nutrition, vol in rows:
+        by_sleep.setdefault(sleep, []).append(vol)
+
+    avg_by_sleep = {k: round(np.mean(v)) for k, v in by_sleep.items()}
+
+    # Simple Pearson correlation: sleep vs volume
+    sleeps = [r[0] for r in rows]
+    vols   = [r[3] for r in rows]
+    r_val, p_val = sp_stats.pearsonr(sleeps, vols) if len(set(sleeps)) > 1 else (0, 1)
+
+    return {
+        'avg_volume_by_sleep': avg_by_sleep,
+        'sleep_volume_r':  round(float(r_val), 3),
+        'sleep_volume_p':  round(float(p_val), 3),
+        'n': len(rows),
+    }
+
+def build_recommendations(analyses, fatigue):
+    recs = []
+
+    # Fatigue warning
+    if fatigue['level'] == 'high':
+        recs.append({
+            'type': 'warning',
+            'title': 'High fatigue accumulation — consider a deload',
+            'detail': (f"Last 4 weeks: {fatigue['recent_4wk']:,} lbs total volume, "
+                       f"up {fatigue['pct_change']}% vs prior 4 weeks. "
+                       "A lighter week now often precedes a PR."),
+        })
+    elif fatigue['level'] == 'low':
+        recs.append({
+            'type': 'info',
+            'title': 'Volume is down recently — push harder if feeling fresh',
+            'detail': (f"Last 4 weeks volume is {abs(fatigue['pct_change'])}% below "
+                       "your prior 4-week average."),
+        })
+
+    for name, a in analyses.items():
+        if not a:
+            continue
+        trend        = a.get('trend')
+        recent_trend = a.get('recent_trend')
+        off          = a.get('off_days', [])
+
+        # Stall detection
+        if (trend and recent_trend and
+                trend['slope_per_week'] > 0.5 and
+                abs(recent_trend['slope_per_week']) < 0.5):
+            recs.append({
+                'type': 'stall',
+                'title': f'{name} has stalled the last 4 weeks',
+                'detail': (f"All-time trend: {trend['slope_per_week']:+.1f} lbs/week, "
+                           f"recent 4 weeks: {recent_trend['slope_per_week']:+.1f} lbs/week. "
+                           "Try a rep scheme change or a planned deload."),
+            })
+        elif trend and trend['slope_per_week'] >= 1.0:
+            recs.append({
+                'type': 'progress',
+                'title': f'{name} is progressing well',
+                'detail': (f"Gaining ~{trend['slope_per_week']:.1f} lbs/week "
+                           f"(R²={trend['r_squared']} — "
+                           f"{'consistent' if trend['r_squared'] > 0.65 else 'variable'} progress)."),
+            })
+
+        # Repeated off-days
+        recent_off = [d for d in off
+                      if d['date'] >= (datetime.now() - timedelta(days=28)).strftime('%Y-%m-%d')]
+        if len(recent_off) >= 2:
+            recs.append({
+                'type': 'warning',
+                'title': f'{name}: {len(recent_off)} low-performance sessions in last 4 weeks',
+                'detail': ("Performance dropped >12% below your rolling average on multiple days. "
+                           "Log session context (sleep, soreness) to help identify the cause."),
+            })
+
+    if not recs:
+        recs.append({
+            'type': 'info',
+            'title': 'Keep training — not enough history for deeper insights yet',
+            'detail': 'Patterns become clearer with more sessions in the database.',
+        })
+
+    return recs
+
+# ─── Analysis routes ──────────────────────────────────────
+@app.route('/api/context', methods=['POST'])
+def api_log_context():
+    data          = request.get_json() or {}
+    lyfta_key     = data.get('lyfta_key', '').strip()
+    workout_date  = data.get('workout_date', '').strip()
+    workout_title = data.get('workout_title', '').strip()
+    rpe           = data.get('rpe')
+    sleep_quality = data.get('sleep_quality')
+    soreness      = data.get('soreness')
+    nutrition     = data.get('nutrition', '')
+    notes         = data.get('notes', '')
+    if not lyfta_key:
+        return jsonify({'ok': False, 'error': 'Missing session key'}), 400
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO session_context '
+                '(lyfta_key, workout_date, workout_title, rpe, sleep_quality, soreness, nutrition, notes) '
+                'VALUES (?,?,?,?,?,?,?,?)',
+                (lyfta_key, workout_date, workout_title, rpe, sleep_quality, soreness, nutrition, notes)
+            )
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/api/context', methods=['GET'])
+def api_get_contexts():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                'SELECT * FROM session_context ORDER BY workout_date DESC'
+            ).fetchall()
+            return jsonify([dict(r) for r in rows])
+    except Exception:
+        return jsonify([])
+
+@app.route('/api/known_1rm', methods=['POST'])
+def api_log_known_1rm():
+    data      = request.get_json() or {}
+    exercise  = data.get('exercise_name', '').strip()
+    date_val  = data.get('date', '').strip()
+    weight    = data.get('weight_lbs')
+    notes     = data.get('notes', '')
+    if not exercise or not date_val or weight is None:
+        return jsonify({'ok': False, 'error': 'Missing required fields'}), 400
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO known_1rm (exercise_name, date, weight_lbs, notes) VALUES (?,?,?,?)',
+                (exercise, date_val, float(weight), notes)
+            )
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/api/known_1rm', methods=['GET'])
+def api_get_known_1rms():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                'SELECT * FROM known_1rm ORDER BY date DESC'
+            ).fetchall()
+            return jsonify([dict(r) for r in rows])
+    except Exception:
+        return jsonify([])
+
+@app.route('/api/analysis')
+def api_analysis():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            workout_count = conn.execute('SELECT COUNT(*) FROM workouts').fetchone()[0]
+            set_count     = conn.execute('SELECT COUNT(*) FROM exercise_sets').fetchone()[0]
+            context_count = conn.execute('SELECT COUNT(*) FROM session_context').fetchone()[0]
+            rm_count      = conn.execute('SELECT COUNT(*) FROM known_1rm').fetchone()[0]
+            # Top exercises by distinct session count (need ≥4 sessions for trend)
+            top_ex = conn.execute('''
+                SELECT exercise_name, COUNT(DISTINCT date) AS sessions
+                FROM   exercise_sets
+                GROUP  BY exercise_name
+                HAVING sessions >= 4
+                ORDER  BY sessions DESC
+                LIMIT  8
+            ''').fetchall()
+
+        analyses = {name: analyze_exercise(name) for name, _ in top_ex}
+        fatigue  = fatigue_indicator()
+        recs     = build_recommendations(analyses, fatigue)
+        ctx      = context_correlations()
+
+        return jsonify({
+            'db_workout_count':  workout_count,
+            'db_set_count':      set_count,
+            'context_entries':   context_count,
+            'known_1rm_entries': rm_count,
+            'status':            'active',
+            'analyses':          analyses,
+            'fatigue':           fatigue,
+            'recommendations':   recs,
+            'context_insights':  ctx,
+        })
+    except Exception as e:
+        return jsonify({
+            'db_workout_count': 0, 'db_set_count': 0,
+            'context_entries': 0, 'known_1rm_entries': 0,
+            'status': 'error', 'error': str(e),
+            'analyses': {}, 'fatigue': {}, 'recommendations': [], 'context_insights': None,
+        })
+
 # ─── Frontend ─────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -441,6 +909,32 @@ HTML = r"""<!DOCTYPE html>
 
   .loading { display: flex; align-items: center; justify-content: center; height: 200px; color: var(--text-muted); font-size: 13px; }
 
+  /* Context / Rating UI */
+  .rating-row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .rating-btn {
+    width: 36px; height: 36px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface2);
+    color: var(--text-muted); font-size: 13px; font-weight: 600;
+    cursor: pointer; transition: all 0.12s;
+  }
+  .rating-btn:hover { border-color: var(--accent); color: var(--text); }
+  .rating-btn.selected { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .nutr-btn {
+    padding: 8px 22px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface2);
+    color: var(--text-muted); font-size: 13px; cursor: pointer; transition: all 0.12s;
+  }
+  .nutr-btn:hover { border-color: var(--accent); color: var(--text); }
+  .nutr-btn.selected { border-color: var(--accent2); color: var(--accent2); background: rgba(0,212,170,0.08); }
+  .log-ctx-btn {
+    padding: 3px 10px; border-radius: 99px;
+    border: 1px solid var(--border); background: var(--surface2);
+    color: var(--text-dim); font-size: 11px; cursor: pointer; transition: all 0.12s;
+    white-space: nowrap;
+  }
+  .log-ctx-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .log-ctx-btn.has-context { border-color: var(--accent2); color: var(--accent2); }
+
   @media (max-width: 900px) {
     .grid-4 { grid-template-columns: repeat(2, 1fr); }
     .grid-3 { grid-template-columns: 1fr 1fr; }
@@ -457,6 +951,7 @@ HTML = r"""<!DOCTYPE html>
     <button class="tab" onclick="showTab('goals', this)">Goals</button>
     <button class="tab" onclick="showTab('exercises', this)">Exercises</button>
     <button class="tab" onclick="showTab('history', this)">History</button>
+    <button class="tab" onclick="showTab('analysis', this)">Analysis</button>
   </div>
   <div style="display:flex;align-items:center;gap:12px">
     <span class="last-refresh" id="last-refresh-lbl"></span>
@@ -601,6 +1096,57 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ANALYSIS -->
+<div id="page-analysis" class="page">
+  <div id="analysis-loading" class="loading">Loading...</div>
+  <div id="analysis-content" style="display:none">
+
+    <div class="grid-3" id="analysis-stat-cards" style="margin-bottom:20px;"></div>
+
+    <div id="recommendations-card" class="card" style="margin-bottom:20px;display:none;">
+      <div class="card-title">Recommendations</div>
+      <div id="recommendations-list" style="display:flex;flex-direction:column;gap:10px;"></div>
+    </div>
+
+    <div class="grid-2 section-gap" style="margin-bottom:20px;">
+      <div class="card" id="fatigue-card">
+        <div class="card-title">Fatigue Accumulation</div>
+        <div id="fatigue-content" style="padding:8px 0;"></div>
+      </div>
+      <div class="card" id="context-insights-card" style="display:none;">
+        <div class="card-title">Context Insights</div>
+        <div id="context-insights-content"></div>
+      </div>
+    </div>
+
+    <div id="trends-section" style="margin-bottom:20px;display:none;">
+      <div class="card-title" style="margin-bottom:14px;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);font-weight:600;">Strength Trends</div>
+      <div id="trends-grid" class="grid-2"></div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <div class="card-title" style="margin-bottom:0;">Known 1RM Log</div>
+        <button onclick="openRmModal()" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text-muted);font-size:12px;cursor:pointer;transition:all 0.15s;" onmouseover="this.style.borderColor='var(--accent2)';this.style.color='var(--accent2)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-muted)'">+ Add 1RM</button>
+      </div>
+      <div id="rm-table-wrap">
+        <div style="color:var(--text-muted);font-size:13px;padding:8px 0;">No known 1RMs logged yet.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title" style="margin-bottom:6px;">Session Context Log</div>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px;">
+        Log context from the History tab — click any session then hit "Log Context."
+      </div>
+      <div id="context-table-wrap">
+        <div style="color:var(--text-muted);font-size:13px;padding:8px 0;">No context logged yet.</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
 <!-- Exercise detail modal -->
 <div class="modal-overlay" id="ex-modal" onclick="closeModal(event)">
   <div class="modal">
@@ -613,6 +1159,96 @@ HTML = r"""<!DOCTYPE html>
     <div class="chart-container-lg" style="margin-bottom:20px;"><canvas id="modalChart"></canvas></div>
     <div class="card-title">All Sets</div>
     <div style="overflow-x:auto;margin-top:10px;"><table class="mini-table" id="modal-sets-table"></table></div>
+  </div>
+</div>
+
+<!-- Context log modal -->
+<div class="modal-overlay" id="context-modal" onclick="closeContextModal(event)">
+  <div class="modal" style="max-width:500px;">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">Log Session Context</div>
+        <div id="context-modal-subtitle" style="font-size:12px;color:var(--text-muted);margin-top:4px;"></div>
+      </div>
+      <button class="modal-close" onclick="document.getElementById('context-modal').classList.remove('open')">&#x2715;</button>
+    </div>
+    <input type="hidden" id="ctx-lyfta-key">
+    <input type="hidden" id="ctx-workout-date">
+    <input type="hidden" id="ctx-workout-title">
+    <div style="display:flex;flex-direction:column;gap:22px;">
+      <div>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Overall RPE — how hard did it feel?</div>
+        <div class="rating-row" id="ctx-rpe-row"></div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-dim);margin-top:4px;"><span>Very Easy</span><span>Maximal</span></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Sleep Quality — night before</div>
+        <div class="rating-row" id="ctx-sleep-row"></div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-dim);margin-top:4px;"><span>Terrible</span><span>Great</span></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Soreness Level</div>
+        <div class="rating-row" id="ctx-soreness-row"></div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-dim);margin-top:4px;"><span>None</span><span>Very Sore</span></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Pre-workout Nutrition</div>
+        <div style="display:flex;gap:8px;">
+          <button class="nutr-btn" data-val="good"  onclick="selectNutrition('good')">Good</button>
+          <button class="nutr-btn" data-val="okay"  onclick="selectNutrition('okay')">Okay</button>
+          <button class="nutr-btn" data-val="poor"  onclick="selectNutrition('poor')">Poor</button>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Notes (optional)</div>
+        <textarea id="ctx-notes" placeholder="e.g. felt tired, skipped warm-up, PR attempt…"
+          style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 12px;color:var(--text);font-size:13px;resize:vertical;min-height:70px;outline:none;font-family:inherit;"></textarea>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:24px;">
+      <button onclick="document.getElementById('context-modal').classList.remove('open')"
+        style="padding:8px 18px;border-radius:6px;border:1px solid var(--border);background:none;color:var(--text-muted);font-size:13px;cursor:pointer;">Cancel</button>
+      <button onclick="saveContext()"
+        style="padding:8px 18px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-size:13px;font-weight:600;cursor:pointer;">Save Context</button>
+    </div>
+  </div>
+</div>
+
+<!-- Known 1RM modal -->
+<div class="modal-overlay" id="rm-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal" style="max-width:420px;">
+    <div class="modal-header">
+      <div class="modal-title">Log Known 1RM</div>
+      <button class="modal-close" onclick="document.getElementById('rm-modal').classList.remove('open')">&#x2715;</button>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:16px;">
+      <div>
+        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Exercise Name</label>
+        <input type="text" id="rm-exercise" placeholder="e.g. Bench Press, Full Squat"
+          style="width:100%;margin-top:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Date Tested</label>
+        <input type="date" id="rm-date"
+          style="width:100%;margin-top:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Weight (lbs)</label>
+        <input type="number" id="rm-weight" placeholder="225" min="1"
+          style="width:100%;margin-top:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Notes (optional)</label>
+        <input type="text" id="rm-notes" placeholder="e.g. gym test, competition"
+          style="width:100%;margin-top:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;outline:none;">
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:24px;">
+      <button onclick="document.getElementById('rm-modal').classList.remove('open')"
+        style="padding:8px 18px;border-radius:6px;border:1px solid var(--border);background:none;color:var(--text-muted);font-size:13px;cursor:pointer;">Cancel</button>
+      <button onclick="saveKnownRm()"
+        style="padding:8px 18px;border-radius:6px;border:none;background:var(--accent2);color:#000;font-size:13px;font-weight:600;cursor:pointer;">Save 1RM</button>
+    </div>
   </div>
 </div>
 
@@ -679,6 +1315,7 @@ function loadTab(name) {
   else if (name === 'goals') loadGoals();
   else if (name === 'exercises') loadExercises();
   else if (name === 'history') loadHistory();
+  else if (name === 'analysis') loadAnalysis();
 }
 
 // ─── Chart helper ─────────────────────────────────────────
@@ -906,7 +1543,7 @@ function closeExModal() { document.getElementById('ex-modal').classList.remove('
 function closeModal(e) { if (e.target === document.getElementById('ex-modal')) closeExModal(); }
 
 // ─── History ─────────────────────────────────────────────
-let allSessions = [];
+let allSessions = [], filteredSessions = [];
 async function loadHistory() {
   document.getElementById('hist-loading').style.display = '';
   document.getElementById('hist-content').style.display = 'none';
@@ -919,12 +1556,12 @@ async function loadHistory() {
 function filterHistory() { renderHistory(); }
 function renderHistory() {
   const q = (document.getElementById('hist-search')?.value || '').toLowerCase();
-  const filtered = allSessions.filter(s =>
+  filteredSessions = allSessions.filter(s =>
     !q || s.title.toLowerCase().includes(q) || s.exercises.some(e => e.toLowerCase().includes(q))
   );
-  document.getElementById('hist-count').textContent = filtered.length + ' sessions';
+  document.getElementById('hist-count').textContent = filteredSessions.length + ' sessions';
   const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  document.getElementById('session-list').innerHTML = filtered.map((s, i) => {
+  document.getElementById('session-list').innerHTML = filteredSessions.map((s, i) => {
     const [,m, day] = s.date.split('-');
     return `
       <div class="session-item" id="sess-${i}" onclick="toggleSession(${i})">
@@ -937,7 +1574,10 @@ function renderHistory() {
             <div class="session-title">${s.title}</div>
             <div class="session-meta">${s.weekday} · ${s.exercises.length} exercises</div>
           </div>
-          <div style="font-size:12px;color:var(--text-muted)">${fmt(s.total_volume)} lbs</div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div style="font-size:12px;color:var(--text-muted)">${fmt(s.total_volume)} lbs</div>
+            <button class="log-ctx-btn" onclick="event.stopPropagation();openContextModal(${i})" title="Log session context">+ Context</button>
+          </div>
         </div>
         <div class="session-exercises">
           ${s.exercises.map(e => `<span class="ex-pill">${e}</span>`).join('')}
@@ -946,6 +1586,313 @@ function renderHistory() {
   }).join('');
 }
 function toggleSession(i) { document.getElementById('sess-' + i).classList.toggle('open'); }
+
+// ─── Context modal ────────────────────────────────────────
+const ctxState = { rpe: null, sleep: null, soreness: null, nutrition: null };
+
+function buildRatingRow(rowId, max, field) {
+  const row = document.getElementById(rowId);
+  row.innerHTML = '';
+  for (let i = 1; i <= max; i++) {
+    const btn = document.createElement('button');
+    btn.className = 'rating-btn';
+    btn.textContent = i;
+    btn.onclick = () => {
+      ctxState[field] = i;
+      row.querySelectorAll('.rating-btn').forEach((b, idx) => b.classList.toggle('selected', idx < i));
+    };
+    row.appendChild(btn);
+  }
+}
+
+function openContextModal(idx) {
+  const s = filteredSessions[idx];
+  if (!s) return;
+  ctxState.rpe = null; ctxState.sleep = null; ctxState.soreness = null; ctxState.nutrition = null;
+  const lyftaKey = s.date + '|' + s.title;
+  document.getElementById('ctx-lyfta-key').value    = lyftaKey;
+  document.getElementById('ctx-workout-date').value  = s.date;
+  document.getElementById('ctx-workout-title').value = s.title;
+  document.getElementById('ctx-notes').value          = '';
+  document.getElementById('context-modal-subtitle').textContent = s.title + ' — ' + s.date_display;
+  buildRatingRow('ctx-rpe-row',     10, 'rpe');
+  buildRatingRow('ctx-sleep-row',    5, 'sleep');
+  buildRatingRow('ctx-soreness-row', 5, 'soreness');
+  document.querySelectorAll('.nutr-btn').forEach(b => b.classList.remove('selected'));
+  document.getElementById('context-modal').classList.add('open');
+}
+
+function selectNutrition(val) {
+  ctxState.nutrition = val;
+  document.querySelectorAll('.nutr-btn').forEach(b => b.classList.toggle('selected', b.dataset.val === val));
+}
+
+async function saveContext() {
+  const lyftaKey = document.getElementById('ctx-lyfta-key').value;
+  const payload = {
+    lyfta_key:     lyftaKey,
+    workout_date:  document.getElementById('ctx-workout-date').value,
+    workout_title: document.getElementById('ctx-workout-title').value,
+    rpe:           ctxState.rpe,
+    sleep_quality: ctxState.sleep,
+    soreness:      ctxState.soreness,
+    nutrition:     ctxState.nutrition,
+    notes:         document.getElementById('ctx-notes').value,
+  };
+  try {
+    const r = await fetch('/api/context', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('context-modal').classList.remove('open');
+      showToast('Context saved', 'success');
+      if (loaded['analysis']) { loaded['analysis'] = false; }
+    } else {
+      showToast('Error: ' + d.error, 'error');
+    }
+  } catch { showToast('Network error', 'error'); }
+}
+
+function closeContextModal(e) {
+  if (e.target === document.getElementById('context-modal'))
+    document.getElementById('context-modal').classList.remove('open');
+}
+
+// ─── Known 1RM modal ──────────────────────────────────────
+function openRmModal() {
+  document.getElementById('rm-exercise').value = '';
+  document.getElementById('rm-date').value     = new Date().toISOString().slice(0, 10);
+  document.getElementById('rm-weight').value   = '';
+  document.getElementById('rm-notes').value    = '';
+  document.getElementById('rm-modal').classList.add('open');
+}
+
+async function saveKnownRm() {
+  const exercise = document.getElementById('rm-exercise').value.trim();
+  const date     = document.getElementById('rm-date').value;
+  const weight   = parseFloat(document.getElementById('rm-weight').value);
+  const notes    = document.getElementById('rm-notes').value;
+  if (!exercise || !date || isNaN(weight) || weight <= 0) {
+    showToast('Fill in exercise, date, and weight', 'error'); return;
+  }
+  try {
+    const r = await fetch('/api/known_1rm', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ exercise_name: exercise, date, weight_lbs: weight, notes }),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('rm-modal').classList.remove('open');
+      showToast('1RM saved', 'success');
+      if (loaded['analysis']) { loaded['analysis'] = false; loadAnalysis(); }
+    } else {
+      showToast('Error: ' + d.error, 'error');
+    }
+  } catch { showToast('Network error', 'error'); }
+}
+
+// ─── Analysis tab ─────────────────────────────────────────
+const trendCharts = {};
+
+async function loadAnalysis() {
+  document.getElementById('analysis-loading').style.display = '';
+  document.getElementById('analysis-content').style.display = 'none';
+
+  const [stats, contexts, rms] = await Promise.all([
+    fetch('/api/analysis').then(r => r.json()),
+    fetch('/api/context').then(r => r.json()),
+    fetch('/api/known_1rm').then(r => r.json()),
+  ]);
+
+  document.getElementById('analysis-loading').style.display = 'none';
+  document.getElementById('analysis-content').style.display = '';
+
+  // ── Stat cards ──
+  const trendCount = Object.values(stats.analyses || {}).filter(Boolean).length;
+  document.getElementById('analysis-stat-cards').innerHTML = [
+    { label: 'Workouts in DB',    value: stats.db_workout_count  || 0, sub: 'synced from Lyfta',               cls: 'accent-purple' },
+    { label: 'Exercises Tracked', value: trendCount,                   sub: 'with enough data for trend lines', cls: 'accent-green'  },
+    { label: 'Known 1RMs',        value: stats.known_1rm_entries || 0, sub: 'calibration anchors',             cls: 'accent-orange' },
+  ].map(c => `
+    <div class="stat-card">
+      <div class="stat-label">${c.label}</div>
+      <div class="stat-value ${c.cls}">${c.value}</div>
+      <div class="stat-sub">${c.sub}</div>
+    </div>`).join('');
+
+  // ── Recommendations ──
+  const recs = stats.recommendations || [];
+  const recCard = document.getElementById('recommendations-card');
+  if (recs.length) {
+    recCard.style.display = '';
+    const typeStyle = {
+      warning:  { border: 'var(--accent3)', icon: '⚠', color: 'var(--accent3)' },
+      stall:    { border: 'var(--accent4)', icon: '⏸', color: 'var(--accent4)' },
+      progress: { border: 'var(--accent2)', icon: '↑',  color: 'var(--accent2)' },
+      info:     { border: 'var(--border)',  icon: 'ℹ',  color: 'var(--text-muted)' },
+    };
+    document.getElementById('recommendations-list').innerHTML = recs.map(r => {
+      const s = typeStyle[r.type] || typeStyle.info;
+      return `<div style="border:1px solid ${s.border};border-radius:8px;padding:14px 16px;background:var(--surface2);">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+          <span style="color:${s.color};font-size:16px;">${s.icon}</span>
+          <span style="font-weight:600;font-size:13px;color:var(--text);">${r.title}</span>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);padding-left:26px;line-height:1.6;">${r.detail}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── Fatigue indicator ──
+  const fat = stats.fatigue || {};
+  const fatColors = { high: 'var(--accent3)', elevated: 'var(--accent4)', normal: 'var(--accent2)', low: 'var(--text-muted)', unknown: 'var(--text-dim)' };
+  const fatColor  = fatColors[fat.level] || fatColors.unknown;
+  const fatPct    = Math.min(Math.max((fat.pct_change || 0) + 50, 0), 100);
+  document.getElementById('fatigue-content').innerHTML = `
+    <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:10px;">
+      <span style="font-size:28px;font-weight:700;color:${fatColor};">${fat.level ? fat.level.charAt(0).toUpperCase() + fat.level.slice(1) : '—'}</span>
+      ${fat.pct_change != null ? `<span style="font-size:13px;color:var(--text-muted);">${fat.pct_change > 0 ? '+' : ''}${fat.pct_change}% vs prior 4 wks</span>` : ''}
+    </div>
+    <div style="height:8px;background:var(--surface2);border-radius:99px;overflow:hidden;border:1px solid var(--border);margin-bottom:10px;">
+      <div style="height:100%;width:${fatPct}%;background:${fatColor};border-radius:99px;transition:width 1s;"></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);">
+      <span>Last 4 wks: ${fat.recent_4wk != null ? Number(fat.recent_4wk).toLocaleString() + ' lbs' : '—'}</span>
+      <span>Prior 4 wks: ${fat.prev_4wk != null ? Number(fat.prev_4wk).toLocaleString() + ' lbs' : '—'}</span>
+    </div>`;
+
+  // ── Context insights ──
+  const ctx = stats.context_insights;
+  const ctxCard = document.getElementById('context-insights-card');
+  if (ctx && ctx.n >= 5) {
+    ctxCard.style.display = '';
+    const sleepMap = ctx.avg_volume_by_sleep;
+    const sleepRows = Object.keys(sleepMap).sort((a,b) => a-b).map(k =>
+      `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px;">
+        <span style="color:var(--text-muted);">Sleep ${k}/5</span>
+        <span style="font-weight:600;">${Number(sleepMap[k]).toLocaleString()} lbs avg volume</span>
+      </div>`
+    ).join('');
+    const rLabel = Math.abs(ctx.sleep_volume_r) > 0.4
+      ? (ctx.sleep_volume_r > 0 ? 'Sleep strongly predicts higher volume' : 'More sleep correlates with lower volume')
+      : 'Weak sleep-volume correlation so far';
+    document.getElementById('context-insights-content').innerHTML = `
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">${rLabel} (r=${ctx.sleep_volume_r}, n=${ctx.n})</div>
+      ${sleepRows}`;
+  }
+
+  // ── Exercise trend charts ──
+  const analyses = stats.analyses || {};
+  const exNames  = Object.keys(analyses).filter(k => analyses[k]);
+  const trendsSection = document.getElementById('trends-section');
+  const trendsGrid    = document.getElementById('trends-grid');
+
+  if (exNames.length) {
+    trendsSection.style.display = '';
+    trendsGrid.innerHTML = exNames.map(name => {
+      const safeid = name.replace(/[^a-zA-Z0-9]/g, '_');
+      return `<div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;">
+          <div style="font-weight:600;font-size:14px;">${name}</div>
+          ${renderTrendBadge(analyses[name])}
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">
+          ${analyses[name].session_count} sessions · max ${analyses[name].all_time_max} lbs
+        </div>
+        <div class="chart-container"><canvas id="trend-${safeid}"></canvas></div>
+        ${analyses[name].off_days && analyses[name].off_days.length ? `<div style="margin-top:8px;font-size:11px;color:var(--accent4);">⚠ ${analyses[name].off_days.length} low-performance session${analyses[name].off_days.length > 1 ? 's' : ''} detected</div>` : ''}
+      </div>`;
+    }).join('');
+
+    // Draw charts after DOM update
+    setTimeout(() => {
+      exNames.forEach(name => {
+        const a       = analyses[name];
+        const safeid  = name.replace(/[^a-zA-Z0-9]/g, '_');
+        const canv    = document.getElementById('trend-' + safeid);
+        if (!canv) return;
+        if (trendCharts[name]) trendCharts[name].destroy();
+        const labels = a.dates.map(d => d.slice(5));
+        trendCharts[name] = new Chart(canv, {
+          type: 'line',
+          data: {
+            labels,
+            datasets: [
+              {
+                label: 'Session Best',
+                data: a.weights,
+                borderColor: 'rgba(108,99,255,0.4)',
+                backgroundColor: 'transparent',
+                pointRadius: 3, pointBackgroundColor: '#6c63ff',
+                tension: 0.2, borderWidth: 1,
+              },
+              {
+                label: 'Smoothed',
+                data: a.smoothed,
+                borderColor: '#6c63ff',
+                backgroundColor: 'rgba(108,99,255,0.08)',
+                pointRadius: 0, tension: 0.3,
+                borderWidth: 2, fill: true,
+              },
+              ...(a.trend ? [{
+                label: 'Trend line',
+                data: a.trend.predicted,
+                borderColor: 'rgba(0,212,170,0.7)',
+                backgroundColor: 'transparent',
+                pointRadius: 0, borderDash: [5, 4],
+                borderWidth: 1.5,
+              }] : []),
+            ],
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { display: true, labels: { color: '#7a7f8e', boxWidth: 10, font: { size: 11 } } } },
+            scales: {
+              x: { grid: { color: '#2a2d36' }, ticks: { color: '#7a7f8e', maxTicksLimit: 8 } },
+              y: { grid: { color: '#2a2d36' }, ticks: { color: '#7a7f8e' } },
+            },
+          },
+        });
+      });
+    }, 50);
+  }
+
+  // ── Known 1RM table ──
+  const rmWrap = document.getElementById('rm-table-wrap');
+  rmWrap.innerHTML = rms.length === 0
+    ? '<div style="color:var(--text-muted);font-size:13px;padding:8px 0;">No known 1RMs logged yet.</div>'
+    : `<table class="mini-table">
+        <thead><tr><th>Exercise</th><th>Date</th><th>Weight</th><th>Notes</th></tr></thead>
+        <tbody>${rms.map(r2 => `<tr>
+          <td style="font-weight:600;">${r2.exercise_name}</td><td>${r2.date}</td>
+          <td style="color:var(--accent2);font-weight:600;">${r2.weight_lbs} lbs</td>
+          <td style="color:var(--text-muted);">${r2.notes || '—'}</td>
+        </tr>`).join('')}</tbody></table>`;
+
+  // ── Context log table ──
+  const ctxWrap = document.getElementById('context-table-wrap');
+  ctxWrap.innerHTML = contexts.length === 0
+    ? '<div style="color:var(--text-muted);font-size:13px;padding:8px 0;">No context logged yet. Go to History and click a session to log context.</div>'
+    : `<div style="overflow-x:auto"><table class="mini-table">
+        <thead><tr><th>Date</th><th>Session</th><th>RPE</th><th>Sleep</th><th>Soreness</th><th>Nutrition</th><th>Notes</th></tr></thead>
+        <tbody>${contexts.map(c => `<tr>
+          <td style="white-space:nowrap;">${c.workout_date}</td>
+          <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.workout_title}</td>
+          <td>${c.rpe           != null ? c.rpe           + '/10' : '—'}</td>
+          <td>${c.sleep_quality != null ? c.sleep_quality + '/5'  : '—'}</td>
+          <td>${c.soreness      != null ? c.soreness      + '/5'  : '—'}</td>
+          <td>${c.nutrition || '—'}</td>
+          <td style="color:var(--text-muted);font-size:12px;">${c.notes || ''}</td>
+        </tr>`).join('')}</tbody></table></div>`;
+}
+
+function renderTrendBadge(a) {
+  if (!a || !a.trend) return '';
+  const slope = a.trend.slope_per_week;
+  const r2    = a.trend.r_squared;
+  if (slope >= 1)   return `<span style="font-size:11px;font-weight:600;color:var(--accent2);background:rgba(0,212,170,0.1);padding:3px 8px;border-radius:99px;">↑ +${slope} lbs/wk</span>`;
+  if (slope <= -1)  return `<span style="font-size:11px;font-weight:600;color:var(--accent3);background:rgba(255,107,107,0.1);padding:3px 8px;border-radius:99px;">↓ ${slope} lbs/wk</span>`;
+  return `<span style="font-size:11px;font-weight:600;color:var(--text-muted);background:var(--surface2);padding:3px 8px;border-radius:99px;">— ${slope > 0 ? '+' : ''}${slope} lbs/wk</span>`;
+}
 
 // ─── Boot ─────────────────────────────────────────────────
 fetch('/api/status').then(r => r.json()).then(d => setLastRefresh(d.last_refresh));
