@@ -69,45 +69,6 @@ def epley_1rm(weight, reps):
         return weight
     return round(weight * (1 + reps / 30), 1)
 
-# ─── Exercise to muscle group mapping ────────────────────
-EXERCISE_MUSCLE_MAP = {
-    # Chest
-    'Bench Press': 'Chest', 'Barbell Bench Press': 'Chest', 'Dumbbell Bench Press': 'Chest',
-    'Incline Bench Press': 'Chest', 'Decline Bench Press': 'Chest', 'Machine Chest Press': 'Chest',
-    'Chest Fly': 'Chest', 'Dumbbell Fly': 'Chest', 'Cable Fly': 'Chest', 'Pec Deck': 'Chest',
-    # Back
-    'Barbell Row': 'Back', 'Dumbbell Row': 'Back', 'Machine Row': 'Back', 'Seal Row': 'Back',
-    'Bent Over Row': 'Back', 'Pendulum Row': 'Back', 'T-Bar Row': 'Back', 'Chest Supported Row': 'Back',
-    'Pull-ups': 'Back', 'Assisted Pull-ups': 'Back', 'Lat Pulldown': 'Back', 'Pull Down': 'Back',
-    'Wide Grip Pulldown': 'Back', 'Seated Row': 'Back', 'Cable Row': 'Back', 'Deadlift': 'Back',
-    'Conventional Deadlift': 'Back', 'Sumo Deadlift': 'Back', 'Trap Bar Deadlift': 'Back',
-    # Legs
-    'Full Squat': 'Legs', 'Barbell Squat': 'Legs', 'Back Squat': 'Legs', 'Front Squat': 'Legs',
-    'Dumbbell Squat': 'Legs', 'Machine Squat': 'Legs', 'Leg Press': 'Legs', 'Hack Squat': 'Legs',
-    'Smith Machine Squat': 'Legs', 'Leg Extension': 'Legs', 'Leg Curl': 'Legs', 'Hamstring Curl': 'Legs',
-    'Calf Raise': 'Legs', 'Seated Calf Raise': 'Legs', 'Standing Calf Raise': 'Legs', 'Leg Raise': 'Legs',
-    'Bulgarian Split Squat': 'Legs', 'Lunge': 'Legs', 'Walking Lunge': 'Legs',
-    # Shoulders
-    'Overhead Press': 'Shoulders', 'Military Press': 'Shoulders', 'Shoulder Press': 'Shoulders',
-    'Dumbbell Shoulder Press': 'Shoulders', 'Machine Shoulder Press': 'Shoulders',
-    'Lateral Raise': 'Shoulders', 'Dumbbell Lateral Raise': 'Shoulders', 'Cable Lateral Raise': 'Shoulders',
-    'Front Raise': 'Shoulders', 'Dumbbell Front Raise': 'Shoulders', 'Reverse Pec Deck': 'Shoulders',
-    'Face Pull': 'Shoulders', 'Upright Row': 'Shoulders', 'Barbell Upright Row': 'Shoulders',
-    # Arms
-    'Barbell Curl': 'Arms', 'Dumbbell Curl': 'Arms', 'Machine Curl': 'Arms', 'Ez Curl': 'Arms',
-    'EZ Curl Bar': 'Arms', 'Cable Curl': 'Arms', 'Preacher Curl': 'Arms', 'Tricep Dip': 'Arms',
-    'Dips': 'Arms', 'Tricep Dips': 'Arms', 'Tricep Extension': 'Arms', 'Rope Tricep Extension': 'Arms',
-    'Dumbbell Tricep Extension': 'Arms', 'Overhead Tricep Extension': 'Arms', 'Skull Crushers': 'Arms',
-    'Barbell Skull Crushers': 'Arms', 'Tricep Rope Pushdown': 'Arms', 'Tricep Pushdown': 'Arms',
-    # Core
-    'Ab Wheel': 'Core', 'Ab Roller': 'Core', 'Planks': 'Core', 'Plank': 'Core',
-    'Cable Crunch': 'Core', 'Machine Crunch': 'Core', 'Decline Sit-ups': 'Core',
-    'Hanging Leg Raise': 'Core', 'Decline Bench Sit-ups': 'Core',
-}
-
-def get_muscle_group(exercise_name):
-    return EXERCISE_MUSCLE_MAP.get(exercise_name, 'Other')
-
 def process_data(workouts):
     sessions = []
     exercise_history = defaultdict(list)  # name -> [{date, weight, reps, e1rm}]
@@ -296,63 +257,6 @@ def api_exercise_detail(name):
         'records': records,
         'stats':   exercise_stats.get(name, {}),
     })
-
-@app.route('/api/pr-progression')
-def api_pr_progression():
-    workouts = get_workouts()
-    _, _, exercise_history = process_data(workouts)
-
-    major_lifts = ['Bench Press', 'Full Squat', 'Deadlift', 'Barbell Row', 'Overhead Press']
-    result = {}
-
-    for lift in major_lifts:
-        records = exercise_history.get(lift, [])
-        if not records:
-            continue
-
-        by_date = defaultdict(lambda: {'weight': 0, 'reps': 0, 'e1rm': 0})
-        for r in records:
-            if r['weight'] > by_date[r['date']]['e1rm']:
-                by_date[r['date']] = {'weight': r['weight'], 'reps': r['reps'], 'e1rm': r['e1rm']}
-
-        timeline = []
-        for date in sorted(by_date.keys()):
-            d = by_date[date]
-            timeline.append({'date': date, 'weight': d['weight'], 'reps': d['reps'], 'e1rm': round(d['e1rm'], 1)})
-
-        max_e1rm = max(r['e1rm'] for r in timeline)
-        result[lift] = {
-            'name': lift,
-            'max_e1rm': round(max_e1rm, 1),
-            'timeline': timeline,
-            'total_sessions': len(timeline),
-        }
-
-    return jsonify(result)
-
-@app.route('/api/muscle-groups')
-def api_muscle_groups():
-    workouts = get_workouts()
-    _, _, exercise_history = process_data(workouts)
-
-    muscle_sets = defaultdict(int)
-    muscle_volume = defaultdict(int)
-
-    for exercise_name, records in exercise_history.items():
-        muscle = get_muscle_group(exercise_name)
-        muscle_sets[muscle] += len(records)
-        muscle_volume[muscle] += sum(r['weight'] * r['reps'] for r in records)
-
-    result = []
-    for muscle, sets in muscle_sets.items():
-        result.append({
-            'muscle': muscle,
-            'sets': sets,
-            'volume': round(muscle_volume[muscle]),
-        })
-
-    result.sort(key=lambda x: x['sets'], reverse=True)
-    return jsonify(result)
 
 # ─── Frontend ─────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -551,8 +455,6 @@ HTML = r"""<!DOCTYPE html>
   <div class="tabs">
     <button class="tab active" onclick="showTab('dashboard', this)">Dashboard</button>
     <button class="tab" onclick="showTab('goals', this)">Goals</button>
-    <button class="tab" onclick="showTab('pr-progress', this)">PR Progress</button>
-    <button class="tab" onclick="showTab('muscle-groups', this)">Muscle Groups</button>
     <button class="tab" onclick="showTab('exercises', this)">Exercises</button>
     <button class="tab" onclick="showTab('history', this)">History</button>
   </div>
@@ -652,40 +554,6 @@ HTML = r"""<!DOCTYPE html>
         <div class="card-title">Full Squat — Max Weight Per Session</div>
         <div class="chart-container-lg"><canvas id="squatChart"></canvas></div>
         <div style="margin-top:16px;"><div class="card-title">Top Sets</div><table class="mini-table" id="squat-top-sets"></table></div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- PR PROGRESS -->
-<div id="page-pr-progress" class="page">
-  <div id="pr-loading" class="loading">Loading...</div>
-  <div id="pr-content" style="display:none">
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(500px,1fr));gap:20px;" id="pr-lifts-container"></div>
-  </div>
-</div>
-
-<!-- MUSCLE GROUPS -->
-<div id="page-muscle-groups" class="page">
-  <div id="mg-loading" class="loading">Loading...</div>
-  <div id="mg-content" style="display:none">
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-title">Total Sets by Muscle Group</div>
-        <div class="chart-container-lg"><canvas id="mgSetsChart"></canvas></div>
-      </div>
-      <div class="card">
-        <div class="card-title">Total Volume by Muscle Group</div>
-        <div class="chart-container-lg"><canvas id="mgVolumeChart"></canvas></div>
-      </div>
-    </div>
-    <div class="card section-gap">
-      <div class="card-title">Muscle Group Summary</div>
-      <div style="overflow-x:auto;margin-top:10px;">
-        <table class="ex-table">
-          <thead><tr><th>Muscle Group</th><th>Sets</th><th>Total Volume (lbs)</th></tr></thead>
-          <tbody id="mg-tbody"></tbody>
-        </table>
       </div>
     </div>
   </div>
@@ -809,8 +677,6 @@ function showTab(name, el) {
 function loadTab(name) {
   if (name === 'dashboard') loadDashboard();
   else if (name === 'goals') loadGoals();
-  else if (name === 'pr-progress') loadPRProgress();
-  else if (name === 'muscle-groups') loadMuscleGroups();
   else if (name === 'exercises') loadExercises();
   else if (name === 'history') loadHistory();
 }
@@ -944,95 +810,6 @@ async function loadGoals() {
   }
   renderTopSets('bench-top-sets', b.top_sets);
   renderTopSets('squat-top-sets', sq.top_sets);
-}
-
-// ─── PR Progress ─────────────────────
-async function loadPRProgress() {
-  document.getElementById('pr-loading').style.display = '';
-  document.getElementById('pr-content').style.display = 'none';
-  const r = await fetch('/api/pr-progression');
-  const d = await r.json();
-
-  document.getElementById('pr-loading').style.display = 'none';
-  document.getElementById('pr-content').style.display = '';
-
-  const container = document.getElementById('pr-lifts-container');
-  container.innerHTML = '';
-
-  const colors = {
-    'Bench Press': '#6c63ff',
-    'Full Squat': '#00d4aa',
-    'Deadlift': '#ff6b6b',
-    'Barbell Row': '#ffa94d',
-    'Overhead Press': '#a78bfa',
-  };
-
-  Object.values(d).forEach((lift, idx) => {
-    const color = colors[lift.name] || '#6c63ff';
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.innerHTML = `
-      <div class="card-title">${lift.name}</div>
-      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:14px;">
-        <div style="font-size:32px;font-weight:700;color:${color}">${lift.max_e1rm}</div>
-        <div style="font-size:14px;color:var(--text-muted)">lbs est. 1RM</div>
-      </div>
-      <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px">${lift.total_sessions} sessions</div>
-      <canvas id="prChart${idx}"></canvas>
-    `;
-    container.appendChild(card);
-
-    const dates = lift.timeline.map(t => t.date.slice(5));
-    const weights = lift.timeline.map(t => t.e1rm);
-    setTimeout(() => {
-      makeChart(`prChart${idx}`, 'line', dates, [{
-        data: weights,
-        borderColor: color,
-        backgroundColor: `${color}15`,
-        tension: 0.3,
-        fill: true,
-        pointRadius: 3,
-      }], { scales: { x: { grid: { color: '#2a2d36' }, ticks: { color: '#7a7f8e', maxTicksLimit: 8 } }, y: { grid: { color: '#2a2d36' }, ticks: { color: '#7a7f8e' } } } });
-    }, 0);
-  });
-}
-
-// ─── Muscle Groups ──────────────────────
-async function loadMuscleGroups() {
-  document.getElementById('mg-loading').style.display = '';
-  document.getElementById('mg-content').style.display = 'none';
-  const r = await fetch('/api/muscle-groups');
-  const d = await r.json();
-
-  document.getElementById('mg-loading').style.display = 'none';
-  document.getElementById('mg-content').style.display = '';
-
-  const muscles = d.map(m => m.muscle);
-  const sets = d.map(m => m.sets);
-  const volumes = d.map(m => m.volume);
-
-  const colors = ['#6c63ff', '#00d4aa', '#ff6b6b', '#ffa94d', '#a78bfa', '#f97316'];
-
-  makeChart('mgSetsChart', 'doughnut', muscles, [{
-    data: sets,
-    backgroundColor: colors.slice(0, muscles.length),
-    borderColor: '#16181c',
-    borderWidth: 2,
-  }], { plugins: { legend: { display: true, position: 'bottom', labels: { color: '#7a7f8e', padding: 14 } } } });
-
-  makeChart('mgVolumeChart', 'doughnut', muscles, [{
-    data: volumes,
-    backgroundColor: colors.slice(0, muscles.length),
-    borderColor: '#16181c',
-    borderWidth: 2,
-  }], { plugins: { legend: { display: true, position: 'bottom', labels: { color: '#7a7f8e', padding: 14 } } } });
-
-  document.getElementById('mg-tbody').innerHTML = d.map(m => `
-    <tr>
-      <td><span class="ex-name">${m.muscle}</span></td>
-      <td>${m.sets}</td>
-      <td>${fmt(m.volume)}</td>
-    </tr>`).join('');
 }
 
 // ─── Exercises ───────────────────────────────────────────
