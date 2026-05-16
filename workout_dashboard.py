@@ -702,15 +702,15 @@ def goal_projection(exercise_name, goal_weight):
     sessions = _exercise_sessions(exercise_name)
     if len(sessions) < 4:
         return None
-    dates    = [s['date']        for s in sessions]
-    weights  = [s['best_weight'] for s in sessions]
-    smoothed = _rolling_max(weights)
-    trend    = _linear_trend(dates, smoothed)
+    dates        = [s['date']        for s in sessions]
+    weights      = [s['best_weight'] for s in sessions]
+    smoothed     = _rolling_max(weights)
+    all_time_max = max(weights)
+    trend        = _linear_trend(dates, smoothed)
     if not trend or trend['slope_per_week'] <= 0:
         return None
-    current = smoothed[-1]
-    if current >= goal_weight:
-        return {'achieved': True, 'current_max': round(current, 1), 'goal': goal_weight}
+    if all_time_max >= goal_weight:
+        return {'achieved': True, 'current_max': round(all_time_max, 1), 'goal': goal_weight}
     d0             = datetime.strptime(dates[0], '%Y-%m-%d')
     slope_per_day  = trend['slope_per_week'] / 7
     intercept      = trend['intercept']
@@ -721,7 +721,7 @@ def goal_projection(exercise_name, goal_weight):
         return None
     return {
         'achieved':       False,
-        'current_max':    round(current, 1),
+        'current_max':    round(all_time_max, 1),
         'goal':           goal_weight,
         'target_date':    target_dt.strftime('%Y-%m-%d'),
         'days_from_now':  days_from_now,
