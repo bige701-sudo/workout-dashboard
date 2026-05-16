@@ -684,6 +684,22 @@ def api_get_known_1rms():
     except Exception:
         return jsonify([])
 
+def _sanitize_for_json(obj):
+    """Convert numpy/scipy types to JSON-safe Python types."""
+    if obj is None:
+        return None
+    if isinstance(obj, (int, float, str, bool)):
+        return obj
+    if isinstance(obj, (np.integer, np.floating)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(item) for item in obj]
+    return str(obj)
+
 @app.route('/api/analysis')
 def api_analysis():
     try:
@@ -707,7 +723,7 @@ def api_analysis():
         recs     = build_recommendations(analyses, fatigue)
         ctx      = context_correlations()
 
-        return jsonify({
+        result = {
             'db_workout_count':  workout_count,
             'db_set_count':      set_count,
             'context_entries':   context_count,
@@ -717,12 +733,16 @@ def api_analysis():
             'fatigue':           fatigue,
             'recommendations':   recs,
             'context_insights':  ctx,
-        })
+        }
+        # Sanitize all values to ensure JSON-serializable
+        result = _sanitize_for_json(result)
+        return jsonify(result)
     except Exception as e:
+        import traceback
         return jsonify({
             'db_workout_count': 0, 'db_set_count': 0,
             'context_entries': 0, 'known_1rm_entries': 0,
-            'status': 'error', 'error': str(e),
+            'status': 'error', 'error': str(e), 'traceback': traceback.format_exc(),
             'analyses': {}, 'fatigue': {}, 'recommendations': [], 'context_insights': None,
         })
 
