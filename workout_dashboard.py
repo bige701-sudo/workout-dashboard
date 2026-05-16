@@ -69,6 +69,13 @@ def init_db():
                 created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(exercise_name, date)
             );
+            CREATE TABLE IF NOT EXISTS body_weight (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                date       TEXT NOT NULL,
+                weight_lbs REAL NOT NULL,
+                source     TEXT DEFAULT 'manual',
+                UNIQUE(date)
+            );
             CREATE INDEX IF NOT EXISTS idx_sets_exercise ON exercise_sets(exercise_name);
             CREATE INDEX IF NOT EXISTS idx_sets_date     ON exercise_sets(date);
         ''')
@@ -135,6 +142,12 @@ def upsert_workouts_to_db(workouts):
             wid = row[0]
             conn.execute('DELETE FROM exercise_sets WHERE workout_id=?', (wid,))
             _insert_sets_for_workout(conn, wid, date_only, w)
+            bw = float(w.get('body_weight') or 0)
+            if bw > 0:
+                conn.execute(
+                    'INSERT OR IGNORE INTO body_weight (date, weight_lbs, source) VALUES (?,?,?)',
+                    (date_only, bw, 'lyfta')
+                )
 
 def load_workouts_from_db():
     try:
@@ -684,6 +697,163 @@ def api_get_known_1rms():
     except Exception:
         return jsonify([])
 
+def goal_projection(exercise_name, goal_weight):
+    """Extrapolate the OLS trend line to predict when goal_weight will be reached."""
+    sessions = _exercise_sessions(exercise_name)
+    if len(sessions) < 4:
+        return None
+    dates    = [s['date']        for s in sessions]
+    weights  = [s['best_weight'] for s in sessions]
+    smoothed = _rolling_max(weights)
+    trend    = _linear_trend(dates, smoothed)
+    if not trend or trend['slope_per_week'] <= 0:
+        return None
+    current = smoothed[-1]
+    if current >= goal_weight:
+        return {'achieved': True, 'current_max': round(current, 1), 'goal': goal_weight}
+    d0             = datetime.strptime(dates[0], '%Y-%m-%d')
+    slope_per_day  = trend['slope_per_week'] / 7
+    intercept      = trend['intercept']
+    days_needed    = (goal_weight - intercept) / slope_per_day
+    target_dt      = d0 + timedelta(days=days_needed)
+    days_from_now  = (target_dt.date() - datetime.now().date()).days
+    if days_from_now < 0 or days_from_now > 730:
+        return None
+    return {
+        'achieved':       False,
+        'current_max':    round(current, 1),
+        'goal':           goal_weight,
+        'target_date':    target_dt.strftime('%Y-%m-%d'),
+        'days_from_now':  days_from_now,
+        'weeks_from_now': round(days_from_now / 7, 1),
+        'slope_per_week': trend['slope_per_week'],
+        'r_squared':      trend['r_squared'],
+    }
+
+
+def protocol_effectiveness(exercise_name):
+    """Segment sessions by avg reps into strength / hypertrophy / endurance buckets
+    and compare e1RM gain rate per protocol."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute('''
+            SELECT date, AVG(reps) AS avg_reps, MAX(e1rm) AS best_e1rm
+            FROM   exercise_sets
+            WHERE  exercise_name = ?
+            GROUP  BY date
+            ORDER  BY date ASC
+        ''', (exercise_name,)).fetchall()
+    if len(rows) < 6:
+        return None
+    buckets = {'strength': [], 'hypertrophy': [], 'endurance': []}
+    for date, avg_reps, best_e1rm in rows:
+        if avg_reps <= 5:
+            buckets['strength'].append((date, best_e1rm))
+        elif avg_reps <= 9:
+            buckets['hypertrophy'].append((date, best_e1rm))
+        else:
+            buckets['endurance'].append((date, best_e1rm))
+    result = {}
+    for label, segs in buckets.items():
+        if len(segs) < 3:
+            result[label] = {'count': len(segs), 'avg_e1rm': None, 'slope_per_week': None}
+            continue
+        dates  = [s[0] for s in segs]
+        e1rms  = [s[1] for s in segs]
+        t      = _linear_trend(dates, e1rms)
+        result[label] = {
+            'count':          len(segs),
+            'avg_e1rm':       round(float(np.mean(e1rms)), 1),
+            'slope_per_week': t['slope_per_week'] if t else None,
+        }
+    filled = [k for k, v in result.items() if v['count'] >= 3]
+    return result if len(filled) >= 1 else None
+
+
+def exercise_correlation():
+    """Lagged Pearson r: leg press volume in week N vs squat e1RM in week N+1."""
+    with sqlite3.connect(DB_PATH) as conn:
+        lp = conn.execute('''
+            SELECT date, SUM(weight*reps) AS vol FROM exercise_sets
+            WHERE exercise_name = 'Leg Press' GROUP BY date ORDER BY date
+        ''').fetchall()
+        sq = conn.execute('''
+            SELECT date, MAX(e1rm) AS e1rm FROM exercise_sets
+            WHERE exercise_name = 'Full Squat' GROUP BY date ORDER BY date
+        ''').fetchall()
+    if len(lp) < 5 or len(sq) < 5:
+        return None
+    from collections import defaultdict as _dd
+    def iso_week(d):
+        dt = datetime.strptime(d, '%Y-%m-%d')
+        y, w, _ = dt.isocalendar()
+        return (y, w)
+    lp_by_week = _dd(float)
+    for date, vol in lp:
+        lp_by_week[iso_week(date)] += vol
+    sq_by_week = _dd(float)
+    for date, e1rm in sq:
+        wk = iso_week(date)
+        sq_by_week[wk] = max(sq_by_week[wk], e1rm)
+    pairs_lp, pairs_sq = [], []
+    for (yr, wk) in sorted(lp_by_week):
+        next_wk = (yr, wk + 1) if wk < 52 else (yr + 1, 1)
+        if next_wk in sq_by_week:
+            pairs_lp.append(lp_by_week[(yr, wk)])
+            pairs_sq.append(sq_by_week[next_wk])
+    if len(pairs_lp) < 4:
+        return None
+    r_val, p_val = sp_stats.pearsonr(pairs_lp, pairs_sq)
+    return {
+        'n_weeks':     len(pairs_lp),
+        'r':           round(float(r_val), 3),
+        'p':           round(float(p_val), 3),
+        'significant': float(p_val) < 0.05,
+    }
+
+
+def training_frequency():
+    """Sessions per week over the full training history."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute('''
+            SELECT strftime('%Y-W%W', date) AS week, COUNT(*) AS cnt
+            FROM workouts GROUP BY week ORDER BY week ASC
+        ''').fetchall()
+    if len(rows) < 4:
+        return None
+    weeks  = [r[0] for r in rows]
+    counts = [r[1] for r in rows]
+    avg    = round(float(np.mean(counts)), 1)
+    r4_avg = round(float(np.mean(counts[-4:])), 1)
+    x = np.arange(len(counts), dtype=float)
+    y = np.array(counts, dtype=float)
+    if len(set(counts)) > 1:
+        slope, _, _, _, _ = sp_stats.linregress(x, y)
+        trend_dir = 'increasing' if slope > 0.05 else 'decreasing' if slope < -0.05 else 'stable'
+    else:
+        trend_dir = 'stable'
+    return {
+        'weeks':           weeks,
+        'counts':          counts,
+        'avg_per_week':    avg,
+        'recent_4wk_avg':  r4_avg,
+        'trend_dir':       trend_dir,
+    }
+
+
+def get_current_bodyweight():
+    """Return most recent body weight entry, or a 215 lb default."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                'SELECT weight_lbs, date, source FROM body_weight ORDER BY date DESC LIMIT 1'
+            ).fetchone()
+            if row:
+                return {'weight_lbs': row[0], 'date': row[1], 'source': row[2]}
+    except Exception:
+        pass
+    return {'weight_lbs': 215.0, 'date': None, 'source': 'default'}
+
+
 def _sanitize_for_json(obj):
     """Convert numpy/scipy types to JSON-safe Python types. NaN/Inf → None."""
     import math
@@ -734,15 +904,22 @@ def api_analysis():
         ctx      = context_correlations()
 
         result = {
-            'db_workout_count':  workout_count,
-            'db_set_count':      set_count,
-            'context_entries':   context_count,
-            'known_1rm_entries': rm_count,
-            'status':            'active',
-            'analyses':          analyses,
-            'fatigue':           fatigue,
-            'recommendations':   recs,
-            'context_insights':  ctx,
+            'db_workout_count':   workout_count,
+            'db_set_count':       set_count,
+            'context_entries':    context_count,
+            'known_1rm_entries':  rm_count,
+            'status':             'active',
+            'analyses':           analyses,
+            'fatigue':            fatigue,
+            'recommendations':    recs,
+            'context_insights':   ctx,
+            'bench_projection':   goal_projection('Bench Press', 225),
+            'squat_projection':   goal_projection('Full Squat', 315),
+            'protocol_bench':     protocol_effectiveness('Bench Press'),
+            'protocol_squat':     protocol_effectiveness('Full Squat'),
+            'exercise_correlation': exercise_correlation(),
+            'training_frequency': training_frequency(),
+            'body_weight':        get_current_bodyweight(),
         }
         # Sanitize all values to ensure JSON-serializable
         result = _sanitize_for_json(result)
@@ -755,6 +932,37 @@ def api_analysis():
             'status': 'error', 'error': str(e), 'traceback': traceback.format_exc(),
             'analyses': {}, 'fatigue': {}, 'recommendations': [], 'context_insights': None,
         })
+
+@app.route('/api/body_weight', methods=['GET'])
+def api_get_body_weight():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                'SELECT date, weight_lbs, source FROM body_weight ORDER BY date ASC'
+            ).fetchall()
+        return jsonify({
+            'history': [{'date': r[0], 'weight_lbs': r[1], 'source': r[2]} for r in rows],
+            'current': get_current_bodyweight(),
+        })
+    except Exception as e:
+        return jsonify({'history': [], 'current': {'weight_lbs': 215.0, 'date': None, 'source': 'default'}})
+
+@app.route('/api/body_weight', methods=['POST'])
+def api_log_body_weight():
+    data     = request.get_json() or {}
+    date_val = data.get('date', '').strip()
+    weight   = data.get('weight_lbs')
+    if not date_val or weight is None:
+        return jsonify({'ok': False, 'error': 'Missing date or weight'}), 400
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO body_weight (date, weight_lbs, source) VALUES (?,?,?)',
+                (date_val, float(weight), 'manual')
+            )
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 # ─── Frontend ─────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -965,6 +1173,20 @@ HTML = r"""<!DOCTYPE html>
   .log-ctx-btn:hover { border-color: var(--accent); color: var(--accent); }
   .log-ctx-btn.has-context { border-color: var(--accent2); color: var(--accent2); }
 
+  /* Phase 3 — projection / protocol / correlation / frequency / body-weight */
+  .proj-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; position: relative; overflow: hidden; }
+  .proj-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; }
+  .proj-card.bench::before { background: linear-gradient(90deg, #6c63ff, #a78bfa); }
+  .proj-card.squat::before { background: linear-gradient(90deg, #00d4aa, #34d399); }
+
+  .proto-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  .proto-table th { font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-dim); padding: 0 10px 8px; text-align: left; font-weight: 600; border-bottom: 1px solid var(--border); }
+  .proto-table td { padding: 8px 10px; font-size: 13px; border-top: 1px solid var(--border); }
+  .proto-table .winner td { background: rgba(0,212,170,0.05); }
+
+  .bw-input-row { display: flex; gap: 10px; align-items: flex-end; margin-top: 12px; flex-wrap: wrap; }
+  .bw-input-row input { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; color: var(--text); font-size: 13px; outline: none; }
+
   @media (max-width: 900px) {
     .grid-4 { grid-template-columns: repeat(2, 1fr); }
     .grid-3 { grid-template-columns: 1fr 1fr; }
@@ -1133,6 +1355,12 @@ HTML = r"""<!DOCTYPE html>
 
     <div class="grid-3" id="analysis-stat-cards" style="margin-bottom:20px;"></div>
 
+    <!-- Goal Projections -->
+    <div id="projections-section" class="grid-2" style="display:none;margin-bottom:20px;">
+      <div class="proj-card bench" id="bench-proj-card"></div>
+      <div class="proj-card squat" id="squat-proj-card"></div>
+    </div>
+
     <div id="recommendations-card" class="card" style="margin-bottom:20px;display:none;">
       <div class="card-title">Recommendations</div>
       <div id="recommendations-list" style="display:flex;flex-direction:column;gap:10px;"></div>
@@ -1152,6 +1380,59 @@ HTML = r"""<!DOCTYPE html>
     <div id="trends-section" style="margin-bottom:20px;display:none;">
       <div class="card-title" style="margin-bottom:14px;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);font-weight:600;">Strength Trends</div>
       <div id="trends-grid" class="grid-2"></div>
+    </div>
+
+    <!-- Training Frequency -->
+    <div class="card section-gap" id="freq-card" style="display:none;margin-bottom:20px;">
+      <div class="card-title">Training Frequency</div>
+      <div id="freq-stats" style="display:flex;gap:28px;margin-bottom:12px;"></div>
+      <div class="chart-container"><canvas id="freqChart"></canvas></div>
+    </div>
+
+    <!-- Protocol Effectiveness -->
+    <div class="grid-2 section-gap" id="proto-section" style="display:none;margin-bottom:20px;">
+      <div class="card">
+        <div class="card-title">Bench Press — Protocol Effectiveness</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">e1RM gain rate by rep range</div>
+        <div id="proto-bench-content"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Full Squat — Protocol Effectiveness</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">e1RM gain rate by rep range</div>
+        <div id="proto-squat-content"></div>
+      </div>
+    </div>
+
+    <!-- Exercise Correlation -->
+    <div class="card section-gap" id="corr-card" style="display:none;margin-bottom:20px;">
+      <div class="card-title">Exercise Correlation — Leg Press → Squat (1-week lag)</div>
+      <div id="corr-content"></div>
+    </div>
+
+    <!-- Body Weight -->
+    <div class="card section-gap" style="margin-bottom:20px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <div class="card-title" style="margin-bottom:0;">Body Weight</div>
+        <div id="bw-current" style="font-size:12px;color:var(--text-muted);"></div>
+      </div>
+      <div id="bw-chart-wrap" style="display:none;margin-bottom:12px;">
+        <div class="chart-container"><canvas id="bwChart"></canvas></div>
+      </div>
+      <div id="bw-ratio" style="font-size:12px;color:var(--text-muted);margin-bottom:12px;"></div>
+      <div class="bw-input-row">
+        <div>
+          <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;display:block;margin-bottom:4px;">Date</label>
+          <input type="date" id="bw-date">
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;display:block;margin-bottom:4px;">Weight (lbs)</label>
+          <input type="number" id="bw-weight" placeholder="215" min="50" max="500" step="0.5" style="width:100px;">
+        </div>
+        <button onclick="logBodyWeight()"
+          style="padding:7px 16px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text-muted);font-size:13px;cursor:pointer;transition:all 0.15s;"
+          onmouseover="this.style.borderColor='var(--accent2)';this.style.color='var(--accent2)'"
+          onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-muted)'">Log Weight</button>
+      </div>
     </div>
 
     <div class="card" style="margin-bottom:20px;">
@@ -1727,10 +2008,11 @@ async function loadAnalysis() {
   document.getElementById('analysis-loading').style.display = '';
   document.getElementById('analysis-content').style.display = 'none';
 
-  const [stats, contexts, rms] = await Promise.all([
+  const [stats, contexts, rms, bwData] = await Promise.all([
     fetch('/api/analysis').then(r => r.json()),
     fetch('/api/context').then(r => r.json()),
     fetch('/api/known_1rm').then(r => r.json()),
+    fetch('/api/body_weight').then(r => r.json()),
   ]);
 
   document.getElementById('analysis-loading').style.display = 'none';
@@ -1886,6 +2168,134 @@ async function loadAnalysis() {
     }, 50);
   }
 
+  // ── Goal Projections ──
+  const benchProj = stats.bench_projection;
+  const squatProj = stats.squat_projection;
+  if (benchProj || squatProj) {
+    document.getElementById('projections-section').style.display = '';
+    function renderProjection(cardId, label, proj, colorVar) {
+      const el = document.getElementById(cardId);
+      if (!proj) {
+        el.innerHTML = `<div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);margin-bottom:6px;">${label}</div><div style="font-size:13px;color:var(--text-muted);">Not enough trend data yet.</div>`;
+        return;
+      }
+      if (proj.achieved) {
+        el.innerHTML = `
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);margin-bottom:6px;">${label}</div>
+          <div style="font-size:32px;font-weight:800;color:var(--accent2);margin-bottom:4px;">Goal achieved!</div>
+          <div style="font-size:13px;color:var(--text-muted);">Current max: ${proj.current_max} lbs</div>`;
+        return;
+      }
+      const d = new Date(proj.target_date + 'T12:00:00');
+      const dateStr = d.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'});
+      el.innerHTML = `
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);margin-bottom:6px;">${label}</div>
+        <div style="font-size:26px;font-weight:800;letter-spacing:-0.5px;margin-bottom:2px;color:${colorVar};">${dateStr}</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px;">${proj.weeks_from_now} weeks away at current pace · R²=${proj.r_squared}</div>
+        <div style="display:flex;gap:20px;">
+          <div><div style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:0.5px;">Current Max</div><div style="font-size:16px;font-weight:700;margin-top:2px;">${proj.current_max} lbs</div></div>
+          <div><div style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:0.5px;">Goal</div><div style="font-size:16px;font-weight:700;margin-top:2px;">${proj.goal} lbs</div></div>
+          <div><div style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:0.5px;">Rate</div><div style="font-size:16px;font-weight:700;margin-top:2px;">+${proj.slope_per_week} lbs/wk</div></div>
+        </div>`;
+    }
+    renderProjection('bench-proj-card', 'Bench Press → 225 lbs', benchProj, 'var(--accent)');
+    renderProjection('squat-proj-card', 'Full Squat → 315 lbs',  squatProj, 'var(--accent2)');
+  }
+
+  // ── Training Frequency ──
+  const freq = stats.training_frequency;
+  if (freq) {
+    document.getElementById('freq-card').style.display = '';
+    const trendColor = freq.trend_dir === 'increasing' ? 'var(--accent2)' : freq.trend_dir === 'decreasing' ? 'var(--accent3)' : 'var(--text-muted)';
+    document.getElementById('freq-stats').innerHTML = [
+      { label: 'All-Time Avg',    value: freq.avg_per_week + '/wk',   color: 'var(--accent)' },
+      { label: 'Recent 4 Weeks',  value: freq.recent_4wk_avg + '/wk', color: 'var(--accent2)' },
+      { label: 'Trend',           value: freq.trend_dir,               color: trendColor },
+    ].map(s => `<div>
+      <div style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:0.5px;">${s.label}</div>
+      <div style="font-size:22px;font-weight:700;color:${s.color};margin-top:2px;">${s.value}</div>
+    </div>`).join('');
+    makeChart('freqChart', 'bar', freq.weeks.map(w => w.slice(5)), [{
+      data: freq.counts,
+      backgroundColor: freq.counts.map(() => 'rgba(108,99,255,0.55)'),
+      borderRadius: 4,
+    }], { plugins: { legend: { display: false } } });
+  }
+
+  // ── Protocol Effectiveness ──
+  const protoBench = stats.protocol_bench;
+  const protoSquat = stats.protocol_squat;
+  if (protoBench || protoSquat) {
+    document.getElementById('proto-section').style.display = '';
+    const protoLabels = { strength: '≤5 reps — Strength', hypertrophy: '6–9 reps — Hypertrophy', endurance: '10+ reps — Endurance' };
+    function renderProtocol(elId, proto) {
+      const el = document.getElementById(elId);
+      if (!proto) { el.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px 0;">Not enough sessions across rep ranges.</div>'; return; }
+      const filled = Object.entries(proto).filter(([,v]) => v.count >= 1);
+      const bestSlope = Math.max(...filled.map(([,v]) => v.slope_per_week ?? -Infinity));
+      const rows = filled.map(([key, val]) => {
+        const slope = val.slope_per_week;
+        const slopeStr = slope != null ? (slope > 0 ? '+' : '') + slope + ' lbs/wk' : 'N/A';
+        const slopeColor = slope != null && slope > 0.5 ? 'var(--accent2)' : slope != null && slope < 0 ? 'var(--accent3)' : 'var(--text-muted)';
+        const isWinner = slope != null && slope === bestSlope && slope > 0;
+        return `<tr${isWinner ? ' class="winner"' : ''}>
+          <td style="font-weight:600;">${protoLabels[key]}</td>
+          <td style="color:var(--text-muted);">${val.count}</td>
+          <td>${val.avg_e1rm != null ? val.avg_e1rm + ' lbs' : '—'}</td>
+          <td style="color:${slopeColor};font-weight:600;">${slopeStr}${isWinner ? ' ★' : ''}</td>
+        </tr>`;
+      }).join('');
+      el.innerHTML = `<table class="proto-table">
+        <thead><tr><th>Protocol</th><th>Sessions</th><th>Avg e1RM</th><th>Gain Rate</th></tr></thead>
+        <tbody>${rows}</tbody></table>`;
+    }
+    renderProtocol('proto-bench-content', protoBench);
+    renderProtocol('proto-squat-content', protoSquat);
+  }
+
+  // ── Exercise Correlation ──
+  const corr = stats.exercise_correlation;
+  if (corr) {
+    document.getElementById('corr-card').style.display = '';
+    const rAbs = Math.abs(corr.r);
+    const rColor = rAbs > 0.5 ? (corr.r > 0 ? 'var(--accent2)' : 'var(--accent3)') : rAbs > 0.3 ? 'var(--accent4)' : 'var(--text-muted)';
+    const rLabel = rAbs > 0.5 ? (corr.r > 0 ? 'strong positive' : 'strong negative')
+                 : rAbs > 0.3 ? (corr.r > 0 ? 'moderate positive' : 'moderate negative')
+                 : 'weak / no';
+    document.getElementById('corr-content').innerHTML = `
+      <div style="display:flex;gap:28px;align-items:flex-end;margin-bottom:10px;">
+        <div><div style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:0.5px;">Pearson r</div><div style="font-size:32px;font-weight:800;color:${rColor};margin-top:2px;">${corr.r}</div></div>
+        <div><div style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:0.5px;">p-value</div><div style="font-size:20px;font-weight:600;color:var(--text-muted);margin-top:2px;">${corr.p}</div></div>
+        <div><div style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:0.5px;">Weeks compared</div><div style="font-size:20px;font-weight:600;color:var(--text-muted);margin-top:2px;">${corr.n_weeks}</div></div>
+      </div>
+      <div style="font-size:13px;color:var(--text-muted);line-height:1.6;">
+        Leg press volume this week has a <strong style="color:${rColor};">${rLabel} correlation</strong> with squat e1RM the following week
+        ${corr.significant ? '— <span style="color:var(--accent2);">statistically significant</span> (p&lt;0.05).' : '— not yet significant (more data needed).'}
+      </div>`;
+  }
+
+  // ── Body Weight ──
+  const bwCurrent = bwData.current || { weight_lbs: 215, date: null, source: 'default' };
+  document.getElementById('bw-current').textContent = bwCurrent.date
+    ? `Current: ${bwCurrent.weight_lbs} lbs (${bwCurrent.date})`
+    : `No entries yet — defaulting to 215 lbs`;
+  document.getElementById('bw-date').value = new Date().toISOString().slice(0, 10);
+  if ((bwData.history || []).length > 1) {
+    document.getElementById('bw-chart-wrap').style.display = '';
+    makeChart('bwChart', 'line', bwData.history.map(r => r.date.slice(5)), [{
+      data: bwData.history.map(r => r.weight_lbs),
+      borderColor: '#ffa94d', backgroundColor: 'rgba(255,169,77,0.08)',
+      tension: 0.3, fill: true, pointRadius: 3, pointBackgroundColor: '#ffa94d',
+    }]);
+  }
+  const bwLbs = bwCurrent.weight_lbs;
+  const benchMax = stats.analyses && stats.analyses['Bench Press'] ? stats.analyses['Bench Press'].all_time_max : null;
+  const squatMax = stats.analyses && stats.analyses['Full Squat']  ? stats.analyses['Full Squat'].all_time_max  : null;
+  const ratios = [];
+  if (benchMax) ratios.push(`Bench <strong>${(benchMax / bwLbs).toFixed(2)}x BW</strong>`);
+  if (squatMax) ratios.push(`Squat <strong>${(squatMax / bwLbs).toFixed(2)}x BW</strong>`);
+  if (ratios.length) document.getElementById('bw-ratio').innerHTML = `Strength-to-bodyweight ratio: ${ratios.join(' · ')}`;
+
   // ── Known 1RM table ──
   const rmWrap = document.getElementById('rm-table-wrap');
   rmWrap.innerHTML = rms.length === 0
@@ -1913,6 +2323,29 @@ async function loadAnalysis() {
           <td>${c.nutrition || '—'}</td>
           <td style="color:var(--text-muted);font-size:12px;">${c.notes || ''}</td>
         </tr>`).join('')}</tbody></table></div>`;
+}
+
+async function logBodyWeight() {
+  const date   = document.getElementById('bw-date').value;
+  const weight = parseFloat(document.getElementById('bw-weight').value);
+  if (!date || isNaN(weight) || weight <= 0) {
+    showToast('Enter a valid date and weight', 'error'); return;
+  }
+  try {
+    const r = await fetch('/api/body_weight', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ date, weight_lbs: weight }),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('bw-weight').value = '';
+      showToast('Body weight logged', 'success');
+      loaded['analysis'] = false;
+      loadAnalysis();
+    } else {
+      showToast('Error: ' + d.error, 'error');
+    }
+  } catch { showToast('Network error', 'error'); }
 }
 
 function renderTrendBadge(a) {
