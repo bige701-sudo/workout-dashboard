@@ -685,15 +685,25 @@ def api_get_known_1rms():
         return jsonify([])
 
 def _sanitize_for_json(obj):
-    """Convert numpy/scipy types to JSON-safe Python types."""
+    """Convert numpy/scipy types to JSON-safe Python types. NaN/Inf → None."""
+    import math
     if obj is None:
         return None
-    if isinstance(obj, (int, float, str, bool)):
+    if isinstance(obj, bool):
         return obj
-    if isinstance(obj, (np.integer, np.floating)):
-        return float(obj)
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, int):
+        return obj
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        val = float(obj)
+        return None if (math.isnan(val) or math.isinf(val)) else val
     if isinstance(obj, np.ndarray):
-        return obj.tolist()
+        return _sanitize_for_json(obj.tolist())
     if isinstance(obj, dict):
         return {k: _sanitize_for_json(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
