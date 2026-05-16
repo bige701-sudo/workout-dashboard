@@ -1,11 +1,13 @@
 from flask import Flask, jsonify, request
 import requests
 import os
-import sqlite3
 import json
 import threading
 from datetime import datetime, timedelta
 from collections import defaultdict
+from contextlib import contextmanager
+import psycopg2
+import psycopg2.extras
 
 app = Flask(__name__)
 
@@ -22,65 +24,84 @@ def load_env():
 
 load_env()
 LYFTA_API_KEY = os.environ.get('LYFTA_API_KEY', '')
-LYFTA_BASE = 'https://my.lyfta.app'
+LYFTA_BASE    = 'https://my.lyfta.app'
+DATABASE_URL  = os.environ.get('DATABASE_URL', '')
 
 # ─── Database ─────────────────────────────────────────────
-DB_PATH = os.path.join(os.path.dirname(__file__), 'workouts.db')
+@contextmanager
+def get_db():
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executescript('''
-            CREATE TABLE IF NOT EXISTS workouts (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                lyfta_key   TEXT UNIQUE NOT NULL,
-                date        TEXT NOT NULL,
-                title       TEXT,
-                total_volume REAL,
-                raw_json    TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS exercise_sets (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                workout_id    INTEGER NOT NULL,
-                date          TEXT NOT NULL,
-                exercise_name TEXT NOT NULL,
-                weight        REAL NOT NULL,
-                reps          INTEGER NOT NULL,
-                e1rm          REAL,
-                FOREIGN KEY (workout_id) REFERENCES workouts(id)
-            );
-            CREATE TABLE IF NOT EXISTS session_context (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                lyfta_key     TEXT UNIQUE NOT NULL,
-                workout_date  TEXT NOT NULL,
-                workout_title TEXT NOT NULL,
-                rpe           INTEGER,
-                sleep_quality INTEGER,
-                soreness      INTEGER,
-                nutrition     TEXT,
-                notes         TEXT,
-                logged_at     TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS known_1rm (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                exercise_name TEXT NOT NULL,
-                date          TEXT NOT NULL,
-                weight_lbs    REAL NOT NULL,
-                notes         TEXT,
-                created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(exercise_name, date)
-            );
-            CREATE TABLE IF NOT EXISTS body_weight (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                date       TEXT NOT NULL,
-                weight_lbs REAL NOT NULL,
-                source     TEXT DEFAULT 'manual',
-                UNIQUE(date)
-            );
-            CREATE INDEX IF NOT EXISTS idx_sets_exercise ON exercise_sets(exercise_name);
-            CREATE INDEX IF NOT EXISTS idx_sets_date     ON exercise_sets(date);
-        ''')
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS workouts (
+                    id           SERIAL PRIMARY KEY,
+                    lyfta_key    TEXT UNIQUE NOT NULL,
+                    date         TEXT NOT NULL,
+                    title        TEXT,
+                    total_volume REAL,
+                    raw_json     TEXT NOT NULL
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS exercise_sets (
+                    id            SERIAL PRIMARY KEY,
+                    workout_id    INTEGER NOT NULL REFERENCES workouts(id),
+                    date          TEXT NOT NULL,
+                    exercise_name TEXT NOT NULL,
+                    weight        REAL NOT NULL,
+                    reps          INTEGER NOT NULL,
+                    e1rm          REAL
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS session_context (
+                    id            SERIAL PRIMARY KEY,
+                    lyfta_key     TEXT UNIQUE NOT NULL,
+                    workout_date  TEXT NOT NULL,
+                    workout_title TEXT NOT NULL,
+                    rpe           INTEGER,
+                    sleep_quality INTEGER,
+                    soreness      INTEGER,
+                    nutrition     TEXT,
+                    notes         TEXT,
+                    logged_at     TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS known_1rm (
+                    id            SERIAL PRIMARY KEY,
+                    exercise_name TEXT NOT NULL,
+                    date          TEXT NOT NULL,
+                    weight_lbs    REAL NOT NULL,
+                    notes         TEXT,
+                    created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(exercise_name, date)
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS body_weight (
+                    id         SERIAL PRIMARY KEY,
+                    date       TEXT NOT NULL,
+                    weight_lbs REAL NOT NULL,
+                    source     TEXT DEFAULT 'manual',
+                    UNIQUE(date)
+                )
+            ''')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_sets_exercise ON exercise_sets(exercise_name)')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_sets_date     ON exercise_sets(date)')
 
-def _insert_sets_for_workout(conn, wid, date_only, w):
+def _insert_sets_for_workout(cur, wid, date_only, w):
     for ex in w.get('exercises', []):
         name = ex.get('excercise_name', '')
         if not name:
@@ -92,70 +113,73 @@ def _insert_sets_for_workout(conn, wid, date_only, w):
             except (ValueError, TypeError):
                 continue
             if weight > 0 and reps > 0:
-                conn.execute(
+                cur.execute(
                     'INSERT INTO exercise_sets '
                     '(workout_id, date, exercise_name, weight, reps, e1rm) '
-                    'VALUES (?,?,?,?,?,?)',
+                    'VALUES (%s,%s,%s,%s,%s,%s)',
                     (wid, date_only, name, weight, reps, epley_1rm(weight, reps))
                 )
 
 def rebuild_exercise_sets():
     """Clear and rebuild exercise_sets from stored raw_json. Fixes duplicate-row bugs."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('DELETE FROM exercise_sets')
-        rows = conn.execute('SELECT id, raw_json FROM workouts').fetchall()
-        for wid, raw in rows:
-            w = json.loads(raw)
-            date_str = w.get('workout_perform_date', '')
-            try:
-                date_only = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
-            except ValueError:
-                continue
-            _insert_sets_for_workout(conn, wid, date_only, w)
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM exercise_sets')
+            cur.execute('SELECT id, raw_json FROM workouts')
+            rows = cur.fetchall()
+            for wid, raw in rows:
+                w = json.loads(raw)
+                date_str = w.get('workout_perform_date', '')
+                try:
+                    date_only = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
+                except ValueError:
+                    continue
+                _insert_sets_for_workout(cur, wid, date_only, w)
 
 def upsert_workouts_to_db(workouts):
-    with sqlite3.connect(DB_PATH) as conn:
-        for w in workouts:
-            date_str  = w.get('workout_perform_date', '')
-            title     = w.get('title', '')
-            total_vol = w.get('total_volume', 0) or 0
-            try:
-                dt        = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-                date_only = dt.strftime('%Y-%m-%d')
-            except ValueError:
-                continue
-            lyfta_key = f"{date_only}|{title}"
-            # INSERT OR IGNORE preserves the existing row ID so the FK in
-            # exercise_sets stays valid; UPDATE keeps the data current.
-            conn.execute(
-                'INSERT OR IGNORE INTO workouts (lyfta_key, date, title, total_volume, raw_json) '
-                'VALUES (?,?,?,?,?)',
-                (lyfta_key, date_only, title, total_vol, json.dumps(w))
-            )
-            conn.execute(
-                'UPDATE workouts SET date=?, title=?, total_volume=?, raw_json=? WHERE lyfta_key=?',
-                (date_only, title, total_vol, json.dumps(w), lyfta_key)
-            )
-            row = conn.execute('SELECT id FROM workouts WHERE lyfta_key=?', (lyfta_key,)).fetchone()
-            if not row:
-                continue
-            wid = row[0]
-            conn.execute('DELETE FROM exercise_sets WHERE workout_id=?', (wid,))
-            _insert_sets_for_workout(conn, wid, date_only, w)
-            bw = float(w.get('body_weight') or 0)
-            if bw > 0:
-                conn.execute(
-                    'INSERT OR IGNORE INTO body_weight (date, weight_lbs, source) VALUES (?,?,?)',
-                    (date_only, bw, 'lyfta')
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for w in workouts:
+                date_str  = w.get('workout_perform_date', '')
+                title     = w.get('title', '')
+                total_vol = w.get('total_volume', 0) or 0
+                try:
+                    dt        = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                    date_only = dt.strftime('%Y-%m-%d')
+                except ValueError:
+                    continue
+                lyfta_key = f"{date_only}|{title}"
+                # INSERT ... ON CONFLICT preserves existing row ID so FK in exercise_sets stays valid.
+                cur.execute(
+                    'INSERT INTO workouts (lyfta_key, date, title, total_volume, raw_json) '
+                    'VALUES (%s,%s,%s,%s,%s) ON CONFLICT (lyfta_key) DO NOTHING',
+                    (lyfta_key, date_only, title, total_vol, json.dumps(w))
                 )
+                cur.execute(
+                    'UPDATE workouts SET date=%s, title=%s, total_volume=%s, raw_json=%s WHERE lyfta_key=%s',
+                    (date_only, title, total_vol, json.dumps(w), lyfta_key)
+                )
+                cur.execute('SELECT id FROM workouts WHERE lyfta_key=%s', (lyfta_key,))
+                row = cur.fetchone()
+                if not row:
+                    continue
+                wid = row[0]
+                cur.execute('DELETE FROM exercise_sets WHERE workout_id=%s', (wid,))
+                _insert_sets_for_workout(cur, wid, date_only, w)
+                bw = float(w.get('body_weight') or 0)
+                if bw > 0:
+                    cur.execute(
+                        'INSERT INTO body_weight (date, weight_lbs, source) VALUES (%s,%s,%s) '
+                        'ON CONFLICT (date) DO NOTHING',
+                        (date_only, bw, 'lyfta')
+                    )
 
 def load_workouts_from_db():
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            rows = conn.execute(
-                'SELECT raw_json FROM workouts ORDER BY date ASC'
-            ).fetchall()
-            return [json.loads(r[0]) for r in rows]
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT raw_json FROM workouts ORDER BY date ASC')
+                return [json.loads(r[0]) for r in cur.fetchall()]
     except Exception:
         return []
 
@@ -410,17 +434,19 @@ from scipy import stats as sp_stats
 
 def _exercise_sessions(exercise_name):
     """Per-session best weight, sets, and volume for one exercise."""
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute('''
-            SELECT date,
-                   MAX(weight)          AS best_weight,
-                   COUNT(*)             AS total_sets,
-                   SUM(weight * reps)   AS total_volume
-            FROM   exercise_sets
-            WHERE  exercise_name = ?
-            GROUP  BY date
-            ORDER  BY date ASC
-        ''', (exercise_name,)).fetchall()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                SELECT date,
+                       MAX(weight)        AS best_weight,
+                       COUNT(*)           AS total_sets,
+                       SUM(weight * reps) AS total_volume
+                FROM   exercise_sets
+                WHERE  exercise_name = %s
+                GROUP  BY date
+                ORDER  BY date ASC
+            ''', (exercise_name,))
+            rows = cur.fetchall()
     return [{'date': r[0], 'best_weight': r[1],
              'total_sets': r[2], 'total_volume': r[3]} for r in rows]
 
@@ -463,17 +489,19 @@ def _off_days(sessions, window=4, threshold=0.12):
     return flagged
 
 def _weekly_volume(exercise_name, weeks=10):
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute('''
-            SELECT strftime('%Y-W%W', date) AS week,
-                   SUM(weight * reps)       AS volume,
-                   COUNT(*)                 AS sets
-            FROM   exercise_sets
-            WHERE  exercise_name = ?
-            GROUP  BY week
-            ORDER  BY week DESC
-            LIMIT  ?
-        ''', (exercise_name, weeks)).fetchall()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                SELECT TO_CHAR(date::date, 'IYYY-"W"IW') AS week,
+                       SUM(weight * reps)                AS volume,
+                       COUNT(*)                          AS sets
+                FROM   exercise_sets
+                WHERE  exercise_name = %s
+                GROUP  BY week
+                ORDER  BY week DESC
+                LIMIT  %s
+            ''', (exercise_name, weeks))
+            rows = cur.fetchall()
     return [{'week': r[0], 'volume': round(r[1]), 'sets': r[2]}
             for r in reversed(rows)]
 
@@ -514,15 +542,19 @@ def analyze_exercise(exercise_name):
 
 def fatigue_indicator():
     """Compare last 4 weeks volume load to prior 4 weeks."""
-    with sqlite3.connect(DB_PATH) as conn:
-        recent = conn.execute(
-            "SELECT COALESCE(SUM(weight*reps),0) FROM exercise_sets "
-            "WHERE date >= date('now','-28 days')"
-        ).fetchone()[0]
-        prior = conn.execute(
-            "SELECT COALESCE(SUM(weight*reps),0) FROM exercise_sets "
-            "WHERE date >= date('now','-56 days') AND date < date('now','-28 days')"
-        ).fetchone()[0]
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(SUM(weight*reps),0) FROM exercise_sets "
+                "WHERE date >= (CURRENT_DATE - INTERVAL '28 days')::text"
+            )
+            recent = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COALESCE(SUM(weight*reps),0) FROM exercise_sets "
+                "WHERE date >= (CURRENT_DATE - INTERVAL '56 days')::text "
+                "AND   date <  (CURRENT_DATE - INTERVAL '28 days')::text"
+            )
+            prior = cur.fetchone()[0]
 
     pct = round(((recent - prior) / prior * 100), 1) if prior else 0
     level = ('high' if pct > 20 else
@@ -533,13 +565,15 @@ def fatigue_indicator():
 
 def context_correlations():
     """Correlate sleep/soreness with total session volume (needs ≥5 entries)."""
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute('''
-            SELECT sc.sleep_quality, sc.soreness, sc.nutrition, w.total_volume
-            FROM   session_context sc
-            JOIN   workouts w ON w.lyfta_key = sc.lyfta_key
-            WHERE  sc.sleep_quality IS NOT NULL AND w.total_volume > 0
-        ''').fetchall()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                SELECT sc.sleep_quality, sc.soreness, sc.nutrition, w.total_volume
+                FROM   session_context sc
+                JOIN   workouts w ON w.lyfta_key = sc.lyfta_key
+                WHERE  sc.sleep_quality IS NOT NULL AND w.total_volume > 0
+            ''')
+            rows = cur.fetchall()
     if len(rows) < 5:
         return None
 
@@ -643,13 +677,17 @@ def api_log_context():
     if not lyfta_key:
         return jsonify({'ok': False, 'error': 'Missing session key'}), 400
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                'INSERT OR REPLACE INTO session_context '
-                '(lyfta_key, workout_date, workout_title, rpe, sleep_quality, soreness, nutrition, notes) '
-                'VALUES (?,?,?,?,?,?,?,?)',
-                (lyfta_key, workout_date, workout_title, rpe, sleep_quality, soreness, nutrition, notes)
-            )
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    'INSERT INTO session_context '
+                    '(lyfta_key, workout_date, workout_title, rpe, sleep_quality, soreness, nutrition, notes) '
+                    'VALUES (%s,%s,%s,%s,%s,%s,%s,%s) '
+                    'ON CONFLICT (lyfta_key) DO UPDATE SET '
+                    'rpe=%s, sleep_quality=%s, soreness=%s, nutrition=%s, notes=%s',
+                    (lyfta_key, workout_date, workout_title, rpe, sleep_quality, soreness, nutrition, notes,
+                     rpe, sleep_quality, soreness, nutrition, notes)
+                )
         return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -657,12 +695,10 @@ def api_log_context():
 @app.route('/api/context', methods=['GET'])
 def api_get_contexts():
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                'SELECT * FROM session_context ORDER BY workout_date DESC'
-            ).fetchall()
-            return jsonify([dict(r) for r in rows])
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute('SELECT * FROM session_context ORDER BY workout_date DESC')
+                return jsonify([dict(r) for r in cur.fetchall()])
     except Exception:
         return jsonify([])
 
@@ -676,11 +712,13 @@ def api_log_known_1rm():
     if not exercise or not date_val or weight is None:
         return jsonify({'ok': False, 'error': 'Missing required fields'}), 400
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                'INSERT OR REPLACE INTO known_1rm (exercise_name, date, weight_lbs, notes) VALUES (?,?,?,?)',
-                (exercise, date_val, float(weight), notes)
-            )
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    'INSERT INTO known_1rm (exercise_name, date, weight_lbs, notes) VALUES (%s,%s,%s,%s) '
+                    'ON CONFLICT (exercise_name, date) DO UPDATE SET weight_lbs=%s, notes=%s',
+                    (exercise, date_val, float(weight), notes, float(weight), notes)
+                )
         return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -688,12 +726,10 @@ def api_log_known_1rm():
 @app.route('/api/known_1rm', methods=['GET'])
 def api_get_known_1rms():
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                'SELECT * FROM known_1rm ORDER BY date DESC'
-            ).fetchall()
-            return jsonify([dict(r) for r in rows])
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute('SELECT * FROM known_1rm ORDER BY date DESC')
+                return jsonify([dict(r) for r in cur.fetchall()])
     except Exception:
         return jsonify([])
 
@@ -734,14 +770,16 @@ def goal_projection(exercise_name, goal_weight):
 def protocol_effectiveness(exercise_name):
     """Segment sessions by avg reps into strength / hypertrophy / endurance buckets
     and compare e1RM gain rate per protocol."""
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute('''
-            SELECT date, AVG(reps) AS avg_reps, MAX(e1rm) AS best_e1rm
-            FROM   exercise_sets
-            WHERE  exercise_name = ?
-            GROUP  BY date
-            ORDER  BY date ASC
-        ''', (exercise_name,)).fetchall()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                SELECT date, AVG(reps) AS avg_reps, MAX(e1rm) AS best_e1rm
+                FROM   exercise_sets
+                WHERE  exercise_name = %s
+                GROUP  BY date
+                ORDER  BY date ASC
+            ''', (exercise_name,))
+            rows = cur.fetchall()
     if len(rows) < 6:
         return None
     buckets = {'strength': [], 'hypertrophy': [], 'endurance': []}
@@ -771,15 +809,18 @@ def protocol_effectiveness(exercise_name):
 
 def exercise_correlation():
     """Lagged Pearson r: leg press volume in week N vs squat e1RM in week N+1."""
-    with sqlite3.connect(DB_PATH) as conn:
-        lp = conn.execute('''
-            SELECT date, SUM(weight*reps) AS vol FROM exercise_sets
-            WHERE exercise_name = 'Leg Press' GROUP BY date ORDER BY date
-        ''').fetchall()
-        sq = conn.execute('''
-            SELECT date, MAX(e1rm) AS e1rm FROM exercise_sets
-            WHERE exercise_name = 'Full Squat' GROUP BY date ORDER BY date
-        ''').fetchall()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                SELECT date, SUM(weight*reps) AS vol FROM exercise_sets
+                WHERE exercise_name = 'Leg Press' GROUP BY date ORDER BY date
+            ''')
+            lp = cur.fetchall()
+            cur.execute('''
+                SELECT date, MAX(e1rm) AS e1rm FROM exercise_sets
+                WHERE exercise_name = 'Full Squat' GROUP BY date ORDER BY date
+            ''')
+            sq = cur.fetchall()
     if len(lp) < 5 or len(sq) < 5:
         return None
     from collections import defaultdict as _dd
@@ -813,11 +854,13 @@ def exercise_correlation():
 
 def training_frequency():
     """Sessions per week over the full training history."""
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute('''
-            SELECT strftime('%Y-W%W', date) AS week, COUNT(*) AS cnt
-            FROM workouts GROUP BY week ORDER BY week ASC
-        ''').fetchall()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                SELECT TO_CHAR(date::date, 'IYYY-"W"IW') AS week, COUNT(*) AS cnt
+                FROM workouts GROUP BY week ORDER BY week ASC
+            ''')
+            rows = cur.fetchall()
     if len(rows) < 4:
         return None
     weeks  = [r[0] for r in rows]
@@ -843,12 +886,12 @@ def training_frequency():
 def get_current_bodyweight():
     """Return most recent body weight entry, or a 215 lb default."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            row = conn.execute(
-                'SELECT weight_lbs, date, source FROM body_weight ORDER BY date DESC LIMIT 1'
-            ).fetchone()
-            if row:
-                return {'weight_lbs': row[0], 'date': row[1], 'source': row[2]}
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT weight_lbs, date, source FROM body_weight ORDER BY date DESC LIMIT 1')
+                row = cur.fetchone()
+                if row:
+                    return {'weight_lbs': row[0], 'date': row[1], 'source': row[2]}
     except Exception:
         pass
     return {'weight_lbs': 215.0, 'date': None, 'source': 'default'}
@@ -883,20 +926,25 @@ def _sanitize_for_json(obj):
 @app.route('/api/analysis')
 def api_analysis():
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            workout_count = conn.execute('SELECT COUNT(*) FROM workouts').fetchone()[0]
-            set_count     = conn.execute('SELECT COUNT(*) FROM exercise_sets').fetchone()[0]
-            context_count = conn.execute('SELECT COUNT(*) FROM session_context').fetchone()[0]
-            rm_count      = conn.execute('SELECT COUNT(*) FROM known_1rm').fetchone()[0]
-            # Top exercises by distinct session count (need ≥4 sessions for trend)
-            top_ex = conn.execute('''
-                SELECT exercise_name, COUNT(DISTINCT date) AS sessions
-                FROM   exercise_sets
-                GROUP  BY exercise_name
-                HAVING sessions >= 4
-                ORDER  BY sessions DESC
-                LIMIT  8
-            ''').fetchall()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT COUNT(*) FROM workouts')
+                workout_count = cur.fetchone()[0]
+                cur.execute('SELECT COUNT(*) FROM exercise_sets')
+                set_count = cur.fetchone()[0]
+                cur.execute('SELECT COUNT(*) FROM session_context')
+                context_count = cur.fetchone()[0]
+                cur.execute('SELECT COUNT(*) FROM known_1rm')
+                rm_count = cur.fetchone()[0]
+                cur.execute('''
+                    SELECT exercise_name, COUNT(DISTINCT date) AS sessions
+                    FROM   exercise_sets
+                    GROUP  BY exercise_name
+                    HAVING COUNT(DISTINCT date) >= 4
+                    ORDER  BY sessions DESC
+                    LIMIT  8
+                ''')
+                top_ex = cur.fetchall()
 
         analyses = {name: analyze_exercise(name) for name, _ in top_ex}
         fatigue  = fatigue_indicator()
@@ -936,15 +984,15 @@ def api_analysis():
 @app.route('/api/body_weight', methods=['GET'])
 def api_get_body_weight():
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            rows = conn.execute(
-                'SELECT date, weight_lbs, source FROM body_weight ORDER BY date ASC'
-            ).fetchall()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT date, weight_lbs, source FROM body_weight ORDER BY date ASC')
+                rows = cur.fetchall()
         return jsonify({
             'history': [{'date': r[0], 'weight_lbs': r[1], 'source': r[2]} for r in rows],
             'current': get_current_bodyweight(),
         })
-    except Exception as e:
+    except Exception:
         return jsonify({'history': [], 'current': {'weight_lbs': 215.0, 'date': None, 'source': 'default'}})
 
 @app.route('/api/body_weight', methods=['POST'])
@@ -955,11 +1003,13 @@ def api_log_body_weight():
     if not date_val or weight is None:
         return jsonify({'ok': False, 'error': 'Missing date or weight'}), 400
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                'INSERT OR REPLACE INTO body_weight (date, weight_lbs, source) VALUES (?,?,?)',
-                (date_val, float(weight), 'manual')
-            )
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    'INSERT INTO body_weight (date, weight_lbs, source) VALUES (%s,%s,%s) '
+                    'ON CONFLICT (date) DO UPDATE SET weight_lbs=%s, source=%s',
+                    (date_val, float(weight), 'manual', float(weight), 'manual')
+                )
         return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500

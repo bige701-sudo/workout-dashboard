@@ -3,3 +3,4 @@ gunicorn
 requests
 numpy
 scipy
+psycopg2-binary
