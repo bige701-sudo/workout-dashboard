@@ -2330,6 +2330,7 @@ async function loadAnalysis() {
     ? `Current: ${bwCurrent.weight_lbs} lbs (${bwCurrent.date})`
     : `No entries yet — defaulting to 215 lbs`;
   document.getElementById('bw-date').value = new Date().toISOString().slice(0, 10);
+  if (bwCurrent.date) document.getElementById('bw-weight').value = bwCurrent.weight_lbs;
   if ((bwData.history || []).length > 1) {
     document.getElementById('bw-chart-wrap').style.display = '';
     makeChart('bwChart', 'line', bwData.history.map(r => r.date.slice(5)), [{
