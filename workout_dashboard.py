@@ -433,12 +433,12 @@ import numpy as np
 from scipy import stats as sp_stats
 
 def _exercise_sessions(exercise_name):
-    """Per-session best weight, sets, and volume for one exercise."""
+    """Per-session best e1RM, sets, and volume for one exercise."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute('''
                 SELECT date,
-                       MAX(weight)        AS best_weight,
+                       ROUND(MAX(weight * (1 + reps / 30.0))::numeric, 1) AS best_e1rm,
                        COUNT(*)           AS total_sets,
                        SUM(weight * reps) AS total_volume
                 FROM   exercise_sets
@@ -447,7 +447,7 @@ def _exercise_sessions(exercise_name):
                 ORDER  BY date ASC
             ''', (exercise_name,))
             rows = cur.fetchall()
-    return [{'date': r[0], 'best_weight': r[1],
+    return [{'date': r[0], 'best_e1rm': float(r[1]),
              'total_sets': r[2], 'total_volume': r[3]} for r in rows]
 
 def _rolling_max(values, window=3):
@@ -473,18 +473,17 @@ def _linear_trend(dates, values):
         'predicted':      predicted,
     }
 
-def _off_days(sessions, window=4, threshold=0.12):
+def _off_days(sessions, values, window=4, threshold=0.12):
     """Flag sessions >12 % below the rolling average of the prior N sessions."""
     flagged = []
-    weights = [s['best_weight'] for s in sessions]
     for i, s in enumerate(sessions):
         if i < window:
             continue
-        avg = np.mean(weights[i - window: i])
-        if avg > 0 and (weights[i] - avg) / avg < -threshold:
+        avg = np.mean(values[i - window: i])
+        if avg > 0 and (values[i] - avg) / avg < -threshold:
             flagged.append({
                 'date':          s['date'],
-                'deviation_pct': round(((weights[i] - avg) / avg) * 100, 1),
+                'deviation_pct': round(((values[i] - avg) / avg) * 100, 1),
             })
     return flagged
 
@@ -510,33 +509,33 @@ def analyze_exercise(exercise_name):
     if len(sessions) < 4:
         return None
 
-    dates   = [s['date']        for s in sessions]
-    weights = [s['best_weight'] for s in sessions]
-    smoothed = _rolling_max(weights, window=3)
+    dates  = [s['date']      for s in sessions]
+    e1rms  = [s['best_e1rm'] for s in sessions]
+    smoothed = _rolling_max(e1rms, window=3)
 
     trend = _linear_trend(dates, smoothed)
 
     # Recent 4-week trend (detect stalls even when all-time trend is positive)
     cutoff = (datetime.now() - timedelta(days=28)).strftime('%Y-%m-%d')
-    recent_s = [s for s in sessions if s['date'] >= cutoff]
-    recent_weights  = [s['best_weight'] for s in recent_s]
-    recent_smoothed = _rolling_max(recent_weights, window=3)
+    recent_s      = [s for s in sessions if s['date'] >= cutoff]
+    recent_e1rms  = [s['best_e1rm'] for s in recent_s]
+    recent_smoothed = _rolling_max(recent_e1rms, window=3)
     recent_trend = (
         _linear_trend([s['date'] for s in recent_s], recent_smoothed)
         if len(recent_s) >= 3 else None
     )
 
     return {
-        'name':         exercise_name,
+        'name':          exercise_name,
         'session_count': len(sessions),
-        'all_time_max': max(weights),
-        'current_max':  weights[-1],
-        'dates':        dates,
-        'weights':      weights,
-        'smoothed':     smoothed,
-        'trend':        trend,
-        'recent_trend': recent_trend,
-        'off_days':     _off_days(sessions),
+        'all_time_max':  round(max(e1rms), 1),
+        'current_max':   e1rms[-1],
+        'dates':         dates,
+        'weights':       e1rms,
+        'smoothed':      smoothed,
+        'trend':         trend,
+        'recent_trend':  recent_trend,
+        'off_days':      _off_days(sessions, e1rms),
         'weekly_volume': _weekly_volume(exercise_name),
     }
 
@@ -2158,7 +2157,7 @@ async function loadAnalysis() {
           ${renderTrendBadge(analyses[name])}
         </div>
         <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">
-          ${analyses[name].session_count} sessions · max ${analyses[name].all_time_max} lbs
+          ${analyses[name].session_count} sessions · peak e1RM: ${analyses[name].all_time_max} lbs
         </div>
         <div class="chart-container"><canvas id="trend-${safeid}"></canvas></div>
         ${analyses[name].off_days && analyses[name].off_days.length ? `<div style="margin-top:8px;font-size:11px;color:var(--accent4);">⚠ ${analyses[name].off_days.length} low-performance session${analyses[name].off_days.length > 1 ? 's' : ''} detected</div>` : ''}
@@ -2180,12 +2179,12 @@ async function loadAnalysis() {
             labels,
             datasets: [
               {
-                label: 'Session Best',
+                label: 'e1RM',
                 data: a.weights,
-                borderColor: 'rgba(108,99,255,0.4)',
+                borderColor: 'rgba(108,99,255,0.5)',
                 backgroundColor: 'transparent',
                 pointRadius: 3, pointBackgroundColor: '#6c63ff',
-                tension: 0.2, borderWidth: 1,
+                tension: 0.2, borderWidth: 1.5,
               },
               {
                 label: 'Smoothed',
@@ -2193,7 +2192,7 @@ async function loadAnalysis() {
                 borderColor: '#6c63ff',
                 backgroundColor: 'rgba(108,99,255,0.08)',
                 pointRadius: 0, tension: 0.3,
-                borderWidth: 2, fill: true,
+                borderWidth: 2.5, fill: true,
               },
               ...(a.trend ? [{
                 label: 'Trend line',
@@ -2402,10 +2401,9 @@ async function logBodyWeight() {
 function renderTrendBadge(a) {
   if (!a || !a.trend) return '';
   const slope = a.trend.slope_per_week;
-  const r2    = a.trend.r_squared;
-  if (slope >= 1)   return `<span style="font-size:11px;font-weight:600;color:var(--accent2);background:rgba(0,212,170,0.1);padding:3px 8px;border-radius:99px;">↑ +${slope} lbs/wk</span>`;
-  if (slope <= -1)  return `<span style="font-size:11px;font-weight:600;color:var(--accent3);background:rgba(255,107,107,0.1);padding:3px 8px;border-radius:99px;">↓ ${slope} lbs/wk</span>`;
-  return `<span style="font-size:11px;font-weight:600;color:var(--text-muted);background:var(--surface2);padding:3px 8px;border-radius:99px;">— ${slope > 0 ? '+' : ''}${slope} lbs/wk</span>`;
+  if (slope >= 1)   return `<span style="font-size:11px;font-weight:600;color:var(--accent2);background:rgba(0,212,170,0.1);padding:3px 8px;border-radius:99px;">↑ +${slope} lbs/wk e1RM</span>`;
+  if (slope <= -1)  return `<span style="font-size:11px;font-weight:600;color:var(--accent3);background:rgba(255,107,107,0.1);padding:3px 8px;border-radius:99px;">↓ ${slope} lbs/wk e1RM</span>`;
+  return `<span style="font-size:11px;font-weight:600;color:var(--text-muted);background:var(--surface2);padding:3px 8px;border-radius:99px;">— ${slope > 0 ? '+' : ''}${slope} lbs/wk e1RM</span>`;
 }
 
 // ─── Boot ─────────────────────────────────────────────────
