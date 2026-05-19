@@ -882,6 +882,25 @@ def training_frequency():
     }
 
 
+def _carry_forward_bodyweight():
+    """If no entry exists for today, insert the most recent known weight."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT 1 FROM body_weight WHERE date = %s', (today,))
+                if cur.fetchone():
+                    return
+                cur.execute('SELECT weight_lbs FROM body_weight ORDER BY date DESC LIMIT 1')
+                row = cur.fetchone()
+                if row:
+                    cur.execute(
+                        'INSERT INTO body_weight (date, weight_lbs, source) VALUES (%s, %s, %s) ON CONFLICT (date) DO NOTHING',
+                        (today, row[0], 'carry_forward')
+                    )
+    except Exception:
+        pass
+
 def get_current_bodyweight():
     """Return most recent body weight entry, or a 215 lb default."""
     try:
@@ -982,6 +1001,7 @@ def api_analysis():
 
 @app.route('/api/body_weight', methods=['GET'])
 def api_get_body_weight():
+    _carry_forward_bodyweight()
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
