@@ -737,8 +737,8 @@ def goal_projection(exercise_name, goal_weight):
     sessions = _exercise_sessions(exercise_name)
     if len(sessions) < 4:
         return None
-    dates        = [s['date']        for s in sessions]
-    weights      = [s['best_weight'] for s in sessions]
+    dates        = [s['date']      for s in sessions]
+    weights      = [s['best_e1rm'] for s in sessions]
     smoothed     = _rolling_max(weights)
     all_time_max = max(weights)
     trend        = _linear_trend(dates, smoothed)
