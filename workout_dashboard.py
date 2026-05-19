@@ -8,6 +8,8 @@ from collections import defaultdict
 from contextlib import contextmanager
 import psycopg2
 import psycopg2.extras
+import cloudinary
+import cloudinary.uploader
 
 app = Flask(__name__)
 
@@ -26,6 +28,9 @@ load_env()
 LYFTA_API_KEY = os.environ.get('LYFTA_API_KEY', '')
 LYFTA_BASE    = 'https://my.lyfta.app'
 DATABASE_URL  = os.environ.get('DATABASE_URL', '')
+
+# ─── Cloudinary ───────────────────────────────────────────
+cloudinary.config(cloudinary_url=os.environ.get('CLOUDINARY_URL', ''))
 
 # ─── Database ─────────────────────────────────────────────
 @contextmanager
@@ -96,6 +101,20 @@ def init_db():
                     weight_lbs REAL NOT NULL,
                     source     TEXT DEFAULT 'manual',
                     UNIQUE(date)
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS lift_videos (
+                    id             SERIAL PRIMARY KEY,
+                    title          TEXT NOT NULL,
+                    exercise_name  TEXT,
+                    date           TEXT,
+                    notes          TEXT,
+                    cloudinary_url TEXT NOT NULL,
+                    cloudinary_id  TEXT NOT NULL,
+                    thumbnail_url  TEXT,
+                    duration_secs  REAL,
+                    created_at     TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             cur.execute('CREATE INDEX IF NOT EXISTS idx_sets_exercise ON exercise_sets(exercise_name)')
@@ -1109,6 +1128,21 @@ HTML = r"""<!DOCTYPE html>
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
   .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
   .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  .video-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  .video-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; cursor: pointer; transition: border-color 0.2s, transform 0.15s; }
+  .video-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .video-thumb { position: relative; aspect-ratio: 16/9; background: #111; overflow: hidden; }
+  .video-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .video-thumb-placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 36px; background: var(--surface2); }
+  .video-play-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.3); opacity: 0; transition: opacity 0.2s; }
+  .video-card:hover .video-play-overlay { opacity: 1; }
+  .video-play-btn { width: 48px; height: 48px; border-radius: 50%; background: rgba(255,255,255,0.9); display: flex; align-items: center; justify-content: center; font-size: 18px; padding-left: 4px; }
+  .video-info { padding: 12px 14px; }
+  .video-title { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .video-tag { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 99px; background: rgba(108,99,255,0.15); color: var(--accent); margin-bottom: 6px; }
+  .video-meta { font-size: 11px; color: var(--text-muted); }
+  .video-delete { float: right; background: none; border: none; color: var(--text-dim); font-size: 14px; cursor: pointer; padding: 2px 4px; border-radius: 4px; }
+  .video-delete:hover { color: var(--accent3); background: rgba(255,107,107,0.1); }
 
   /* Cards */
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
@@ -1273,6 +1307,7 @@ HTML = r"""<!DOCTYPE html>
     <button class="tab" onclick="showTab('exercises', this)">Exercises</button>
     <button class="tab" onclick="showTab('history', this)">History</button>
     <button class="tab" onclick="showTab('analysis', this)">Analysis</button>
+    <button class="tab" onclick="showTab('videos', this)">Videos</button>
   </div>
   <div style="display:flex;align-items:center;gap:12px">
     <span class="last-refresh" id="last-refresh-lbl"></span>
@@ -1632,6 +1667,86 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- VIDEOS -->
+<div id="page-videos" class="page">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
+    <div>
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Lift Videos</div>
+      <div style="font-size:13px;color:var(--text-muted);">1RMs, AMRAPs, and form checks</div>
+    </div>
+    <button onclick="openVideoUpload()"
+      style="padding:9px 18px;border-radius:8px;border:none;background:var(--accent);color:#fff;font-size:13px;font-weight:600;cursor:pointer;">+ Upload Video</button>
+  </div>
+  <div id="video-loading" class="loading">Loading...</div>
+  <div id="video-gallery" class="video-grid" style="display:none;"></div>
+  <div id="video-empty" style="display:none;text-align:center;padding:80px 20px;color:var(--text-muted);">
+    <div style="font-size:52px;margin-bottom:14px;">&#127910;</div>
+    <div style="font-size:15px;font-weight:600;margin-bottom:6px;color:var(--text);">No videos yet</div>
+    <div style="font-size:13px;">Upload your first lift video to get started.</div>
+  </div>
+</div>
+
+<!-- Video upload modal -->
+<div class="modal-overlay" id="video-upload-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal" style="max-width:460px;">
+    <div class="modal-header">
+      <div class="modal-title">Upload Lift Video</div>
+      <button class="modal-close" onclick="document.getElementById('video-upload-modal').classList.remove('open')">&#x2715;</button>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:14px;">
+      <div>
+        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Video File (MP4)</label>
+        <input type="file" id="video-file-input" accept="video/*"
+          style="width:100%;margin-top:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;outline:none;cursor:pointer;">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Title</label>
+        <input type="text" id="video-title" placeholder="e.g. 315 lb Squat PR"
+          style="width:100%;margin-top:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Exercise</label>
+        <input type="text" id="video-exercise" placeholder="e.g. Full Squat, Bench Press"
+          style="width:100%;margin-top:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Date</label>
+        <input type="date" id="video-date"
+          style="width:100%;margin-top:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;font-weight:600;">Notes (optional)</label>
+        <input type="text" id="video-notes" placeholder="e.g. competition, AMRAP, form check"
+          style="width:100%;margin-top:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;outline:none;">
+      </div>
+      <div id="video-upload-progress" style="display:none;">
+        <div style="background:var(--surface2);border-radius:4px;height:6px;overflow:hidden;">
+          <div id="video-progress-bar" style="background:var(--accent);height:6px;border-radius:4px;width:0%;transition:width 0.4s;"></div>
+        </div>
+        <div id="video-upload-status" style="font-size:12px;color:var(--text-muted);margin-top:6px;">Uploading to Cloudinary…</div>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px;">
+      <button onclick="document.getElementById('video-upload-modal').classList.remove('open')"
+        style="padding:8px 18px;border-radius:6px;border:1px solid var(--border);background:none;color:var(--text-muted);font-size:13px;cursor:pointer;">Cancel</button>
+      <button id="video-upload-btn" onclick="uploadVideo()"
+        style="padding:8px 18px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-size:13px;font-weight:600;cursor:pointer;">Upload</button>
+    </div>
+  </div>
+</div>
+
+<!-- Video player modal -->
+<div class="modal-overlay" id="video-player-modal" onclick="if(event.target===this)closeVideoPlayer()">
+  <div style="max-width:820px;width:95%;background:var(--surface);border-radius:12px;overflow:hidden;border:1px solid var(--border);">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;background:var(--surface2);">
+      <div id="video-player-title" style="font-weight:600;font-size:15px;"></div>
+      <button onclick="closeVideoPlayer()" style="background:none;border:none;color:var(--text-muted);font-size:22px;cursor:pointer;line-height:1;">&#x2715;</button>
+    </div>
+    <video id="video-player" controls style="width:100%;display:block;max-height:72vh;background:#000;"></video>
+    <div id="video-player-meta" style="padding:12px 18px;font-size:13px;color:var(--text-muted);"></div>
+  </div>
+</div>
+
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
@@ -1696,6 +1811,7 @@ function loadTab(name) {
   else if (name === 'exercises') loadExercises();
   else if (name === 'history') loadHistory();
   else if (name === 'analysis') loadAnalysis();
+  else if (name === 'videos') loadVideos();
 }
 
 // ─── Chart helper ─────────────────────────────────────────
@@ -2426,6 +2542,151 @@ function renderTrendBadge(a) {
   return `<span style="font-size:11px;font-weight:600;color:var(--text-muted);background:var(--surface2);padding:3px 8px;border-radius:99px;">— ${slope > 0 ? '+' : ''}${slope} lbs/wk e1RM</span>`;
 }
 
+// ─── Videos ──────────────────────────────────────────────
+async function loadVideos() {
+  document.getElementById('video-loading').style.display = '';
+  document.getElementById('video-gallery').style.display = 'none';
+  document.getElementById('video-empty').style.display = 'none';
+  try {
+    const videos = await fetch('/api/videos').then(r => r.json());
+    document.getElementById('video-loading').style.display = 'none';
+    if (!Array.isArray(videos) || videos.length === 0) {
+      document.getElementById('video-empty').style.display = '';
+      return;
+    }
+    const gallery = document.getElementById('video-gallery');
+    gallery.innerHTML = videos.map(v => {
+      const thumb = v.thumbnail_url
+        ? `<img src="${v.thumbnail_url}" alt="${v.title}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
+        : '';
+      const placeholder = `<div class="video-thumb-placeholder" style="${v.thumbnail_url ? 'display:none' : ''}">&#127910;</div>`;
+      const dur = v.duration_secs ? `${Math.round(v.duration_secs)}s · ` : '';
+      const date = v.date || '';
+      return `<div class="video-card" onclick="playVideo(${v.id}, '${escHtml(v.title)}', '${v.url}', '${escHtml(v.exercise_name||'')}', '${date}', '${escHtml(v.notes||'')}')">
+        <div class="video-thumb">
+          ${thumb}${placeholder}
+          <div class="video-play-overlay"><div class="video-play-btn">&#9654;</div></div>
+        </div>
+        <div class="video-info">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+            <div class="video-title" style="flex:1;margin-right:6px;">${escHtml(v.title)}</div>
+            <button class="video-delete" onclick="event.stopPropagation();deleteVideo(${v.id})" title="Delete">&#x2715;</button>
+          </div>
+          ${v.exercise_name ? `<span class="video-tag">${escHtml(v.exercise_name)}</span>` : ''}
+          <div class="video-meta">${dur}${date}</div>
+          ${v.notes ? `<div class="video-meta" style="margin-top:2px;">${escHtml(v.notes)}</div>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+    gallery.style.display = '';
+  } catch (e) {
+    document.getElementById('video-loading').style.display = 'none';
+    showToast('Failed to load videos', 'error');
+  }
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function openVideoUpload() {
+  document.getElementById('video-upload-modal').classList.add('open');
+  document.getElementById('video-file-input').value = '';
+  document.getElementById('video-title').value = '';
+  document.getElementById('video-exercise').value = '';
+  document.getElementById('video-date').value = new Date().toISOString().slice(0,10);
+  document.getElementById('video-notes').value = '';
+  document.getElementById('video-upload-progress').style.display = 'none';
+  document.getElementById('video-upload-btn').disabled = false;
+}
+
+async function uploadVideo() {
+  const file    = document.getElementById('video-file-input').files[0];
+  const title   = document.getElementById('video-title').value.trim();
+  const exercise = document.getElementById('video-exercise').value.trim();
+  const date    = document.getElementById('video-date').value;
+  const notes   = document.getElementById('video-notes').value.trim();
+  if (!file)  { showToast('Please select a video file', 'error'); return; }
+  if (!title) { showToast('Please enter a title', 'error'); return; }
+
+  const btn = document.getElementById('video-upload-btn');
+  const progressWrap = document.getElementById('video-upload-progress');
+  const progressBar  = document.getElementById('video-progress-bar');
+  const statusText   = document.getElementById('video-upload-status');
+  btn.disabled = true;
+  progressWrap.style.display = '';
+  progressBar.style.width = '0%';
+  statusText.textContent = 'Uploading… (large files may take a minute)';
+
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('title', title);
+  fd.append('exercise_name', exercise);
+  fd.append('date', date);
+  fd.append('notes', notes);
+
+  // Animate progress bar while waiting (indeterminate)
+  let pct = 0;
+  const ticker = setInterval(() => {
+    pct = Math.min(pct + 2, 90);
+    progressBar.style.width = pct + '%';
+  }, 400);
+
+  try {
+    const r = await fetch('/api/videos/upload', { method: 'POST', body: fd });
+    const d = await r.json();
+    clearInterval(ticker);
+    if (d.ok) {
+      progressBar.style.width = '100%';
+      statusText.textContent = 'Upload complete!';
+      setTimeout(() => {
+        document.getElementById('video-upload-modal').classList.remove('open');
+        loadVideos();
+        showToast('Video uploaded!', 'success');
+      }, 600);
+    } else {
+      progressWrap.style.display = 'none';
+      btn.disabled = false;
+      showToast('Upload failed: ' + (d.error || 'unknown error'), 'error');
+    }
+  } catch (e) {
+    clearInterval(ticker);
+    progressWrap.style.display = 'none';
+    btn.disabled = false;
+    showToast('Network error during upload', 'error');
+  }
+}
+
+function playVideo(id, title, url, exercise, date, notes) {
+  document.getElementById('video-player-title').textContent = title;
+  const player = document.getElementById('video-player');
+  player.src = url;
+  player.load();
+  const parts = [];
+  if (exercise) parts.push(exercise);
+  if (date) parts.push(date);
+  if (notes) parts.push(notes);
+  document.getElementById('video-player-meta').textContent = parts.join(' · ');
+  document.getElementById('video-player-modal').classList.add('open');
+}
+
+function closeVideoPlayer() {
+  const player = document.getElementById('video-player');
+  player.pause();
+  player.src = '';
+  document.getElementById('video-player-modal').classList.remove('open');
+}
+
+async function deleteVideo(id) {
+  if (!confirm('Delete this video? This cannot be undone.')) return;
+  try {
+    const r = await fetch('/api/videos/' + id, { method: 'DELETE' });
+    const d = await r.json();
+    if (d.ok) { loadVideos(); showToast('Video deleted', 'success'); }
+    else showToast('Delete failed: ' + (d.error || ''), 'error');
+  } catch (e) { showToast('Network error', 'error'); }
+}
+
 // ─── Boot ─────────────────────────────────────────────────
 fetch('/api/status').then(r => r.json()).then(d => setLastRefresh(d.last_refresh));
 loadTab('dashboard');
@@ -2433,6 +2694,75 @@ loaded['dashboard'] = true;
 </script>
 </body>
 </html>"""
+
+@app.route('/api/videos', methods=['GET'])
+def api_get_videos():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    SELECT id, title, exercise_name, date, notes,
+                           cloudinary_url, cloudinary_id, thumbnail_url, duration_secs, created_at
+                    FROM lift_videos ORDER BY created_at DESC
+                ''')
+                rows = cur.fetchall()
+        return jsonify([{
+            'id': r[0], 'title': r[1], 'exercise_name': r[2], 'date': r[3],
+            'notes': r[4], 'url': r[5], 'cloudinary_id': r[6],
+            'thumbnail_url': r[7], 'duration_secs': r[8], 'created_at': r[9],
+        } for r in rows])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/videos/upload', methods=['POST'])
+def api_upload_video():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    file      = request.files['file']
+    title     = request.form.get('title', '').strip()
+    exercise  = request.form.get('exercise_name', '').strip()
+    date_val  = request.form.get('date', '').strip()
+    notes     = request.form.get('notes', '').strip()
+    if not title:
+        return jsonify({'error': 'Title is required'}), 400
+    try:
+        result = cloudinary.uploader.upload(
+            file,
+            resource_type='video',
+            folder='workout_lifts',
+        )
+        video_url  = result['secure_url']
+        public_id  = result['public_id']
+        duration   = result.get('duration')
+        # Generate thumbnail: same URL but transformed to JPEG at 0s
+        thumb_url  = video_url.replace('/video/upload/', '/video/upload/so_0,f_jpg,w_480/').rsplit('.', 1)[0] + '.jpg'
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    INSERT INTO lift_videos (title, exercise_name, date, notes, cloudinary_url, cloudinary_id, thumbnail_url, duration_secs)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+                ''', (title, exercise or None, date_val or None, notes or None,
+                      video_url, public_id, thumb_url, duration))
+                video_id = cur.fetchone()[0]
+        return jsonify({'ok': True, 'id': video_id, 'url': video_url})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/videos/<int:video_id>', methods=['DELETE'])
+def api_delete_video(video_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT cloudinary_id FROM lift_videos WHERE id = %s', (video_id,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({'error': 'Not found'}), 404
+                cloudinary.uploader.destroy(row[0], resource_type='video')
+                cur.execute('DELETE FROM lift_videos WHERE id = %s', (video_id,))
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/')
 def index():

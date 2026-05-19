@@ -4,3 +4,4 @@ requests
 numpy
 scipy
 psycopg2-binary
+cloudinary
