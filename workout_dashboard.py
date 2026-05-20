@@ -1255,7 +1255,7 @@ HTML = r"""<!DOCTYPE html>
   .session-exercises { display: none; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); flex-direction: column; gap: 16px; }
   .session-item.open .session-exercises { display: flex; }
   .session-item.open .sess-chevron { transform: rotate(180deg); }
-  .sess-ex-block { display: flex; flex-direction: column; gap: 6px; }
+  .sess-ex-block { display: flex; flex-direction: column; gap: 6px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; }
   .sess-ex-name { font-size: 12px; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px; }
   .sess-sets-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .sess-sets-table th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; font-size: 10px; padding: 3px 10px 5px 0; text-align: left; border-bottom: 1px solid var(--border); }
