@@ -436,6 +436,43 @@ def api_history():
     sessions, _, _ = process_data(workouts)
     return jsonify(sessions)
 
+@app.route('/api/history/<date>')
+def api_history_detail(date):
+    """Return every set for a given date, grouped by exercise in workout order."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''
+                    SELECT es.exercise_name,
+                           es.weight,
+                           es.reps,
+                           es.e1rm,
+                           es.id
+                    FROM   exercise_sets es
+                    WHERE  es.date = %s
+                    ORDER  BY es.workout_id, es.id
+                ''', (date,))
+                rows = cur.fetchall()
+
+        grouped = {}
+        order   = []
+        for name, weight, reps, e1rm, _ in rows:
+            if name not in grouped:
+                grouped[name] = []
+                order.append(name)
+            grouped[name].append({
+                'weight': weight,
+                'reps':   reps,
+                'e1rm':   round(e1rm, 1) if e1rm else None,
+            })
+
+        return jsonify([
+            {'exercise': name, 'sets': grouped[name]}
+            for name in order
+        ])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/exercise/<name>')
 def api_exercise_detail(name):
     workouts = get_workouts()
@@ -1215,8 +1252,18 @@ HTML = r"""<!DOCTYPE html>
   .session-info { flex: 1; }
   .session-title { font-weight: 600; font-size: 14px; }
   .session-meta { font-size: 12px; color: var(--text-muted); margin-top: 3px; }
-  .session-exercises { display: none; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); flex-wrap: wrap; gap: 6px; }
+  .session-exercises { display: none; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); flex-direction: column; gap: 16px; }
   .session-item.open .session-exercises { display: flex; }
+  .session-item.open .sess-chevron { transform: rotate(180deg); }
+  .sess-ex-block { display: flex; flex-direction: column; gap: 6px; }
+  .sess-ex-name { font-size: 12px; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px; }
+  .sess-sets-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .sess-sets-table th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; font-size: 10px; padding: 3px 10px 5px 0; text-align: left; border-bottom: 1px solid var(--border); }
+  .sess-sets-table td { padding: 5px 10px 5px 0; color: var(--text); border-bottom: 1px solid rgba(255,255,255,0.04); }
+  .sess-sets-table tr:last-child td { border-bottom: none; }
+  .sess-set-num { color: var(--text-muted); }
+  .sess-ex-summary { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+  .sess-detail-loading { font-size: 12px; color: var(--text-muted); padding: 6px 0; }
   .ex-pill { display: inline-block; padding: 3px 10px; border-radius: 99px; font-size: 12px; background: var(--surface2); border: 1px solid var(--border); color: var(--text-muted); }
 
   /* Modal */
@@ -2073,15 +2120,70 @@ function renderHistory() {
           <div style="display:flex;align-items:center;gap:10px;">
             <div style="font-size:12px;color:var(--text-muted)">${fmt(s.total_volume)} lbs</div>
             <button class="log-ctx-btn" onclick="event.stopPropagation();openContextModal(${i})" title="Log session context">+ Context</button>
+            <span class="sess-chevron" style="font-size:11px;color:var(--text-muted);transition:transform 0.2s;">▼</span>
           </div>
         </div>
-        <div class="session-exercises">
-          ${s.exercises.map(e => `<span class="ex-pill">${e}</span>`).join('')}
+        <div class="session-exercises" id="sess-detail-${i}">
+          <div class="sess-detail-loading">Loading sets…</div>
         </div>
       </div>`;
   }).join('');
 }
-function toggleSession(i) { document.getElementById('sess-' + i).classList.toggle('open'); }
+
+const _sessDetailCache = {};
+async function toggleSession(i) {
+  const el = document.getElementById('sess-' + i);
+  const isOpen = el.classList.contains('open');
+  el.classList.toggle('open');
+  if (isOpen) return; // closing — nothing to load
+
+  const s = filteredSessions[i];
+  if (_sessDetailCache[s.date]) {
+    renderSessDetail(i, _sessDetailCache[s.date]);
+    return;
+  }
+
+  try {
+    const data = await fetch('/api/history/' + s.date).then(r => r.json());
+    _sessDetailCache[s.date] = data;
+    renderSessDetail(i, data);
+  } catch (e) {
+    document.getElementById('sess-detail-' + i).innerHTML =
+      '<div class="sess-detail-loading">Failed to load sets.</div>';
+  }
+}
+
+function renderSessDetail(i, exercises) {
+  const container = document.getElementById('sess-detail-' + i);
+  if (!exercises || exercises.error || exercises.length === 0) {
+    container.innerHTML = '<div class="sess-detail-loading">No set data found.</div>';
+    return;
+  }
+  container.innerHTML = exercises.map(ex => {
+    const bestE1rm = Math.max(...ex.sets.map(s => s.e1rm || 0));
+    const totalVol = ex.sets.reduce((sum, s) => sum + s.weight * s.reps, 0);
+    const rows = ex.sets.map((s, idx) => `
+      <tr>
+        <td class="sess-set-num">${idx + 1}</td>
+        <td><strong>${s.weight}</strong> lbs</td>
+        <td>${s.reps} reps</td>
+        <td style="color:var(--accent)">${s.e1rm ? s.e1rm + ' lbs' : '—'}</td>
+      </tr>`).join('');
+    return `<div class="sess-ex-block">
+      <div class="sess-ex-name">${ex.exercise}</div>
+      <table class="sess-sets-table">
+        <thead><tr>
+          <th>Set</th><th>Weight</th><th>Reps</th><th>e1RM</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="sess-ex-summary">
+        ${ex.sets.length} sets · ${Math.round(totalVol).toLocaleString()} lbs volume
+        ${bestE1rm > 0 ? ' · best e1RM ' + bestE1rm + ' lbs' : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
 
 // ─── Context modal ────────────────────────────────────────
 const ctxState = { rpe: null, sleep: null, soreness: null, nutrition: null };
